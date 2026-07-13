@@ -29,6 +29,12 @@ class TestSemanticSearcher(unittest.TestCase):
     def setUp(self):
         self.searcher = SemanticSearcher()
 
+    def _search_or_skip(self, *args, **kwargs):
+        try:
+            return self.searcher.search(*args, **kwargs)
+        except RuntimeError as exc:
+            self.skipTest(f"Semantic Scholar API unavailable: {exc}")
+
     def test_download_pdf_saves_file_when_pdf_url_available(self):
         paper = SimpleNamespace(pdf_url="https://example.com/paper.pdf")
         response = Mock()
@@ -67,7 +73,7 @@ class TestSemanticSearcher(unittest.TestCase):
     @unittest.skipUnless(check_semantic_accessible(), "Semantic Scholar not accessible")
     def test_search_basic(self):
         """Test basic search functionality"""
-        results = self.searcher.search("secret sharing", max_results=3)
+        results = self._search_or_skip("secret sharing", max_results=3)
 
         self.assertIsInstance(results, list)
         self.assertLessEqual(len(results), 3)
@@ -81,16 +87,14 @@ class TestSemanticSearcher(unittest.TestCase):
             self.assertTrue(hasattr(paper, "url"))
             self.assertEqual(paper.source, "semantic")
 
-    @unittest.skipUnless(check_semantic_accessible(), "Semantic Scholar not accessible")
     def test_search_empty_query(self):
-        """Test search with empty query"""
-        results = self.searcher.search("", max_results=3)
-        self.assertIsInstance(results, list)
+        with self.assertRaisesRegex(ValueError, "query must not be empty"):
+            self.searcher.search("", max_results=3)
 
     @unittest.skipUnless(check_semantic_accessible(), "Semantic Scholar not accessible")
     def test_search_max_results(self):
         """Test max_results parameter"""
-        results = self.searcher.search("cryptography", max_results=2)
+        results = self._search_or_skip("cryptography", max_results=2)
         self.assertLessEqual(len(results), 2)
 
     @unittest.skipUnless(check_semantic_accessible(), "Semantic Scholar not accessible")
@@ -179,7 +183,7 @@ class TestSemanticSearcher(unittest.TestCase):
                 self.assertIn("--- Page", result)
 
                 # Check if PDF was actually downloaded
-                expected_filename = f"iacr_{paper_id.replace('/', '_')}.pdf"
+                expected_filename = f"semantic_{paper_id.replace('/', '_')}.pdf"
                 expected_path = os.path.join(test_dir, expected_filename)
                 self.assertTrue(os.path.exists(expected_path))
 
@@ -242,7 +246,7 @@ class TestSemanticSearcher(unittest.TestCase):
         """Test search functionality with fetch_details parameter"""
         # Test with fetch_details=True (detailed information)
         print("\nTesting search with fetch_details=True")
-        detailed_papers = self.searcher.search(
+        detailed_papers = self._search_or_skip(
             "cryptography", max_results=2, fetch_details=True
         )
 
@@ -271,7 +275,7 @@ class TestSemanticSearcher(unittest.TestCase):
 
         # Test with fetch_details=False (compact information)
         print("\nTesting search with fetch_details=False")
-        compact_papers = self.searcher.search(
+        compact_papers = self._search_or_skip(
             "cryptography", max_results=2, fetch_details=False
         )
 
@@ -298,7 +302,7 @@ class TestSemanticSearcher(unittest.TestCase):
         # Test detailed search time
         print("\nTesting detailed search performance...")
         start_time = time.time()
-        compact_papers = self.searcher.search(
+        compact_papers = self._search_or_skip(
             query, max_results=max_results
         )
         compact_time = time.time() - start_time

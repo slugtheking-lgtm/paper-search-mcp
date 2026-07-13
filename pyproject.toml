@@ -16,7 +16,10 @@ keywords = [
     "papers",
     "search",
     "arxiv",
-    "pubmed",
+    "core",
+    "doaj",
+    "openalex",
+    "crossref",
     "semantic-scholar",
 ]
 classifiers = [

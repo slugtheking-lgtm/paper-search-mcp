@@ -9,28 +9,12 @@ import json
 import sys
 from typing import Any, Dict, List
 
-from .config import get_env
 from .academic_platforms.arxiv import ArxivSearcher
-from .academic_platforms.pubmed import PubMedSearcher
-from .academic_platforms.biorxiv import BioRxivSearcher
-from .academic_platforms.medrxiv import MedRxivSearcher
-from .academic_platforms.google_scholar import GoogleScholarSearcher
-from .academic_platforms.iacr import IACRSearcher
 from .academic_platforms.semantic import SemanticSearcher
 from .academic_platforms.crossref import CrossRefSearcher
 from .academic_platforms.openalex import OpenAlexSearcher
-from .academic_platforms.pmc import PMCSearcher
 from .academic_platforms.core import CORESearcher
-from .academic_platforms.europepmc import EuropePMCSearcher
-from .academic_platforms.dblp import DBLPSearcher
-from .academic_platforms.openaire import OpenAiresearcher
-from .academic_platforms.citeseerx import CiteSeerXSearcher
 from .academic_platforms.doaj import DOAJSearcher
-from .academic_platforms.base_search import BASESearcher
-from .academic_platforms.unpaywall import UnpaywallResolver, UnpaywallSearcher
-from .academic_platforms.zenodo import ZenodoSearcher
-from .academic_platforms.hal import HALSearcher
-from .academic_platforms.ssrn import SSRNSearcher
 
 # ---------------------------------------------------------------------------
 # Searcher registry
@@ -45,45 +29,15 @@ def _init_searchers() -> None:
         return
 
     SEARCHERS["arxiv"] = ArxivSearcher()
-    SEARCHERS["pubmed"] = PubMedSearcher()
-    SEARCHERS["biorxiv"] = BioRxivSearcher()
-    SEARCHERS["medrxiv"] = MedRxivSearcher()
-    SEARCHERS["google_scholar"] = GoogleScholarSearcher()
-    SEARCHERS["iacr"] = IACRSearcher()
     SEARCHERS["semantic"] = SemanticSearcher()
     SEARCHERS["crossref"] = CrossRefSearcher()
     SEARCHERS["openalex"] = OpenAlexSearcher()
-    SEARCHERS["pmc"] = PMCSearcher()
     SEARCHERS["core"] = CORESearcher()
-    SEARCHERS["europepmc"] = EuropePMCSearcher()
-    SEARCHERS["dblp"] = DBLPSearcher()
-    SEARCHERS["openaire"] = OpenAiresearcher()
-    SEARCHERS["citeseerx"] = CiteSeerXSearcher()
     SEARCHERS["doaj"] = DOAJSearcher()
-    SEARCHERS["base"] = BASESearcher()
-    unpaywall_resolver = UnpaywallResolver()
-    SEARCHERS["unpaywall"] = UnpaywallSearcher(resolver=unpaywall_resolver)
-    SEARCHERS["zenodo"] = ZenodoSearcher()
-    SEARCHERS["hal"] = HALSearcher()
-    SEARCHERS["ssrn"] = SSRNSearcher()
-
-    # Optional paid connectors
-    ieee_key = get_env("IEEE_API_KEY", "")
-    if ieee_key:
-        from .academic_platforms.ieee import IEEESearcher
-        SEARCHERS["ieee"] = IEEESearcher()
-
-    acm_key = get_env("ACM_API_KEY", "")
-    if acm_key:
-        from .academic_platforms.acm import ACMSearcher
-        SEARCHERS["acm"] = ACMSearcher()
 
 
 ALL_SOURCES = [
-    "arxiv", "pubmed", "biorxiv", "medrxiv", "google_scholar", "iacr",
-    "semantic", "crossref", "openalex", "pmc", "core", "europepmc",
-    "dblp", "openaire", "citeseerx", "doaj", "base", "zenodo", "hal",
-    "ssrn", "unpaywall",
+    "arxiv", "core", "doaj", "semantic", "openalex", "crossref",
 ]
 
 
@@ -143,8 +97,30 @@ async def cmd_search(args: argparse.Namespace) -> int:
     for src in selected:
         searcher = SEARCHERS[src]
         extra = {}
-        if src == "semantic" and args.year:
+        if src == "arxiv":
+            extra["sorted_by"] = args.sorted_by
             extra["year"] = args.year
+            extra["author"] = args.author
+        elif src == "core":
+            extra["sorted_by"] = args.sorted_by
+            extra["year"] = args.year
+            extra["author"] = args.author
+        elif src == "doaj":
+            extra["sorted_by"] = args.sorted_by
+            extra["year"] = args.year
+            extra["author"] = args.author
+        elif src == "semantic":
+            extra["sorted_by"] = args.sorted_by
+            extra["year"] = args.year
+            extra["author"] = args.author
+        elif src == "openalex":
+            extra["sorted_by"] = args.sorted_by
+            extra["year"] = args.year
+            extra["author"] = args.author
+        elif src == "crossref":
+            extra["sorted_by"] = args.sorted_by
+            extra["year"] = args.year
+            extra["author"] = args.author
         tasks[src] = _async_search(searcher, args.query, args.max_results, **extra)
 
     names = list(tasks.keys())
@@ -228,18 +204,24 @@ async def cmd_sources(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="paper-search",
-        description="Search, download, and read academic papers from 20+ sources.",
+        description="Search, download, and read papers from six academic sources.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # search
     p_search = sub.add_parser("search", help="Search for papers across academic platforms")
     p_search.add_argument("query", help="Search query")
-    p_search.add_argument("-n", "--max-results", type=int, default=5, help="Max results per source (default: 5)")
+    p_search.add_argument("-y", "--year", default=None,
+                          help="Year filter: YYYY, YYYY-YYYY, YYYY-, or -YYYY")
     p_search.add_argument("-s", "--sources", default="all",
                           help="Comma-separated sources or 'all' (default: all)")
-    p_search.add_argument("-y", "--year", default=None,
-                          help="Year filter for Semantic Scholar (e.g. '2020', '2018-2022')")
+    p_search.add_argument("-n", "--max-results", type=int, default=5,
+                          help="Final result limit per source (default: 5)")
+    p_search.add_argument("-sort", "--sorted-by",
+                          choices=("relevance", "date", "updated", "recency"),
+                          default="relevance", help="Sort results (default: relevance)")
+    p_search.add_argument("-au", "--author", default=None,
+                          help="Author name as a complete phrase")
 
     # download
     p_dl = sub.add_parser("download", help="Download a paper PDF")

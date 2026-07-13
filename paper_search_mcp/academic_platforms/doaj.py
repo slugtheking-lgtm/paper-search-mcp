@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import requests
 import logging
+import re
 import time
 from urllib.parse import quote
 from ..paper import Paper
@@ -20,12 +21,46 @@ from .base import PaperSource
 
 logger = logging.getLogger(__name__)
 
+DOAJ_FINANCE_FILTER = (
+    "("
+    'index.classification:"Social Sciences: Finance" OR '
+    'index.classification:"Social Sciences: Commerce: Business" OR '
+    'index.classification:"Accounting. Bookkeeping" OR '
+    'index.classification:"Public finance" OR '
+    "bibjson.subject.term:finance OR "
+    "bibjson.subject.term:financial OR "
+    "bibjson.subject.term:economics OR "
+    "bibjson.subject.term:banking OR "
+    "bibjson.subject.term:investment OR "
+    "bibjson.subject.term:securities OR "
+    "bibjson.subject.term:insurance OR "
+    "bibjson.keywords:finance OR "
+    "bibjson.keywords:financial OR "
+    "bibjson.keywords:banking OR "
+    "bibjson.keywords:investment"
+    ")"
+)
+
+DOAJ_SORT_MAP = {
+    "relevance": None,
+    # DOAJ's live search index rejects bibjson.year as a sort field. These
+    # top-level record timestamps are explicitly present in the article schema
+    # and accepted by the API's field:direction sort syntax.
+    "date": "created_date",
+    "recency": "last_updated",
+}
+
 
 class DOAJSearcher(PaperSource):
     """Searcher for DOAJ (Directory of Open Access Journals)."""
 
     BASE_URL = "https://doaj.org/api"
+    PAGE_SIZE = 100
     USER_AGENT = "paper-search-mcp/0.1.3 (https://github.com/openags/paper-search-mcp)"
+    YEAR_ERROR = (
+        "year must use one of: YYYY, YYYY-YYYY, YYYY-, or -YYYY "
+        '(for example: "2024", "2020-2024", "2020-", "-2020")'
+    )
 
     def __init__(self, api_key: Optional[str] = None):
         """Initialize DOAJ searcher.
@@ -51,167 +86,142 @@ class DOAJSearcher(PaperSource):
                 "Get a free API key at: https://doaj.org/apply-for-api-key/"
             )
 
-    def search(self, query: str, max_results: int = 10, **kwargs) -> List[Paper]:
-        """Search DOAJ for open access journal articles.
+    @staticmethod
+    def _normalize_phrase(value: str, field_name: str) -> str:
+        """Normalize user input as a literal DOAJ phrase."""
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        phrase = " ".join(value.strip().split())
+        if len(phrase) >= 2 and phrase.startswith('"') and phrase.endswith('"'):
+            phrase = " ".join(phrase[1:-1].strip().split())
+        if not phrase:
+            raise ValueError(f"{field_name} must not be empty")
+        if '"' in phrase:
+            raise ValueError(
+                f"{field_name} must be plain text and must not contain embedded double quotes"
+            )
+        return f'"{phrase}"'
 
-        Args:
-            query: Search query string (supports Lucene query syntax)
-            max_results: Maximum number of results (1-100, DOAJ default: 10)
-            **kwargs: Additional parameters:
-                - year: Filter by publication year (e.g., 2023)
-                - journal: Filter by journal ISSN or title
-                - publisher: Filter by publisher
-                - country: Filter by country
-                - language: Filter by language (e.g., 'en')
-                - subject: Filter by subject category
-                - open_access: Filter by open access status (default: True for DOAJ)
-                - sort: Sort field (e.g., 'created_date', 'title')
-                - sort_dir: Sort direction ('asc' or 'desc')
+    @classmethod
+    def _build_year_condition(cls, year: str) -> str:
+        """Compile a public year expression to a DOAJ bibjson.year condition."""
+        if not isinstance(year, str):
+            raise ValueError(cls.YEAR_ERROR)
+        value = year.strip()
+        single = re.fullmatch(r"(\d{4})", value)
+        closed = re.fullmatch(r"(\d{4})-(\d{4})", value)
+        since = re.fullmatch(r"(\d{4})-", value)
+        until = re.fullmatch(r"-(\d{4})", value)
 
-        Returns:
-            List of Paper objects
-        """
-        if max_results > 100:
-            max_results = 100  # DOAJ API limit per request
-        if max_results < 1:
-            max_results = 10
+        if single:
+            return f"bibjson.year:{single.group(1)}"
+        if closed:
+            start_year, end_year = int(closed.group(1)), int(closed.group(2))
+            if start_year > end_year:
+                raise ValueError("year start must not be greater than year end")
+            return f"bibjson.year:[{start_year:04d} TO {end_year:04d}]"
+        if since:
+            return f"bibjson.year:[{since.group(1)} TO *]"
+        if until:
+            return f"bibjson.year:[* TO {until.group(1)}]"
+        raise ValueError(cls.YEAR_ERROR)
 
-        papers = []
-        page_size = min(max_results, 100)  # DOAJ max page size
+    @classmethod
+    def _build_search_query(
+        cls,
+        query: str,
+        year: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> str:
+        """Build query, finance scope, author, and year in DOAJ order."""
+        parts = [cls._normalize_phrase(query, "query"), DOAJ_FINANCE_FILTER]
+        if author is not None:
+            parts.append(f'bibjson.author.name:{cls._normalize_phrase(author, "author")}')
+        if year is not None:
+            parts.append(cls._build_year_condition(year))
+        return " AND ".join(parts)
+
+    @staticmethod
+    def _validate_max_results(max_results: int) -> None:
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+            raise ValueError("max_results must be a positive integer")
+
+    @staticmethod
+    def _map_sort(sorted_by: str) -> Optional[str]:
+        try:
+            field = DOAJ_SORT_MAP[sorted_by]
+        except (KeyError, TypeError):
+            raise ValueError("DOAJ sorted_by must be one of: relevance, date, recency") from None
+        return f"{field}:desc" if field is not None else None
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        sorted_by: str = "relevance",
+        year: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> List[Paper]:
+        """Search DOAJ with client-controlled page and pageSize pagination."""
+        self._validate_max_results(max_results)
+        search_query = self._build_search_query(query, year=year, author=author)
+        sort = self._map_sort(sorted_by)
+        search_url = f"{self.BASE_URL}/search/articles/{quote(search_query, safe='')}"
+        papers: List[Paper] = []
+        records_seen = 0
         page = 1
 
-        try:
-            # Build Lucene query
-            lucene_query = self._build_lucene_query(query, kwargs)
+        while records_seen < max_results:
+            page_size = min(self.PAGE_SIZE, max_results - records_seen)
+            params: Dict[str, Any] = {"page": page, "pageSize": page_size}
+            if sort is not None:
+                params["sort"] = sort
 
-            params = {
-                'page': page,
-                'pageSize': page_size,
-                'query': lucene_query
-            }
+            try:
+                response = self.session.get(search_url, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+            except requests.exceptions.RequestException as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                logger.error("DOAJ API request failed (status=%s): %s", status_code, exc)
+                if status_code is not None:
+                    if status_code == 429:
+                        logger.warning("DOAJ rate limit exceeded. Consider using API key.")
+                raise RuntimeError(
+                    f"DOAJ API request failed (status={status_code}): {exc}"
+                ) from exc
+            except ValueError as exc:
+                logger.error("Failed to parse DOAJ JSON response: %s", exc)
+                raise RuntimeError("DOAJ returned an invalid JSON response") from exc
 
-            # Add sorting
-            if 'sort' in kwargs:
-                params['sort'] = kwargs['sort']
-                if 'sort_dir' in kwargs and kwargs['sort_dir'] in ('asc', 'desc'):
-                    params['sort_dir'] = kwargs['sort_dir']
+            if "error" in data:
+                logger.error("DOAJ API error: %s", data["error"])
+                raise RuntimeError(f'DOAJ API error: {data["error"]}')
+            results = data.get("results", [])
+            if not results:
+                break
 
-            # Make request to DOAJ API
-            encoded_query = quote(query.strip() or "*", safe="")
-            search_url = f"{self.BASE_URL}/search/articles/{encoded_query}"
-            response = self.session.get(
-                search_url,
-                params=params,
-                timeout=30
-            )
-            response.raise_for_status()
-
-            data = response.json()
-
-            # Check for API errors
-            if 'error' in data:
-                logger.error(f"DOAJ API error: {data['error']}")
-                return papers
-
-            total = data.get('total', 0)
-            logger.info(f"DOAJ search found {total} total results")
-
-            # Parse results
-            results = data.get('results', [])
             for item in results:
-                if len(papers) >= max_results:
-                    break
-
                 try:
                     paper = self._parse_doaj_item(item)
                     if paper:
                         papers.append(paper)
-                except Exception as e:
-                    logger.warning(f"Error parsing DOAJ item: {e}")
-                    continue
+                except Exception as exc:
+                    logger.warning("Error parsing DOAJ item: %s", exc)
 
-            # Rate limiting - be polite to DOAJ API
-            # Public access: 100 requests/hour, API key: higher limits
+            records_seen += len(results)
+            total = data.get("total")
+            if len(results) < page_size:
+                break
+            if isinstance(total, int) and records_seen >= total:
+                break
+            if records_seen >= max_results:
+                break
+
+            page += 1
             time.sleep(0.5 if self.api_key else 1.0)
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"DOAJ API request failed: {e}")
-            if hasattr(e, 'response') and e.response is not None:
-                logger.error(f"Response status: {e.response.status_code}")
-                if e.response.status_code == 429:
-                    logger.warning("DOAJ rate limit exceeded. Consider using API key.")
-        except ValueError as e:
-            logger.error(f"Failed to parse DOAJ JSON response: {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error in DOAJ search: {e}")
-
         return papers[:max_results]
-
-    def _build_lucene_query(self, query: str, filters: Dict[str, Any]) -> str:
-        """Build Lucene query string for DOAJ API.
-
-        DOAJ uses Lucene query syntax with field-specific filters.
-
-        Args:
-            query: Base search query
-            filters: Additional filter parameters
-
-        Returns:
-            Lucene query string
-        """
-        query_parts = []
-
-        # Add base query
-        if query:
-            # Search in title, abstract, keywords, fulltext
-            query_parts.append(f"({query})")
-
-        # Add year filter
-        if 'year' in filters and filters['year']:
-            year = filters['year']
-            if isinstance(year, str) and '-' in year:
-                # Year range
-                year_range = year.split('-')
-                if len(year_range) == 2:
-                    query_parts.append(f"year:[{year_range[0]} TO {year_range[1]}]")
-            else:
-                query_parts.append(f"year:{year}")
-
-        # Add journal filter
-        if 'journal' in filters and filters['journal']:
-            journal = filters['journal']
-            # Try as ISSN first, then as title
-            if len(journal) == 9 and '-' in journal:  # ISSN format: 1234-5678
-                query_parts.append(f"issn:{journal}")
-            else:
-                query_parts.append(f"journal.title:{journal}")
-
-        # Add publisher filter
-        if 'publisher' in filters and filters['publisher']:
-            query_parts.append(f"publisher:{filters['publisher']}")
-
-        # Add country filter
-        if 'country' in filters and filters['country']:
-            query_parts.append(f"country:{filters['country']}")
-
-        # Add language filter
-        if 'language' in filters and filters['language']:
-            query_parts.append(f"language:{filters['language']}")
-
-        # Add subject filter
-        if 'subject' in filters and filters['subject']:
-            query_parts.append(f"subject:{filters['subject']}")
-
-        # DOAJ only contains open access content, but we can still filter
-        if 'open_access' in filters and filters['open_access'] is not None:
-            # DOAJ is all open access, but we can filter by license type
-            pass
-
-        # Combine query parts with AND
-        if len(query_parts) == 0:
-            return "*:*"  # Match all query
-
-        return " AND ".join(f"({part})" for part in query_parts)
 
     def _parse_doaj_item(self, item: Dict[str, Any]) -> Optional[Paper]:
         """Parse DOAJ API response item to Paper object.

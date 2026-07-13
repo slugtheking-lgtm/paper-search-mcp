@@ -15,7 +15,7 @@ class Paper:
     published_date: Optional[datetime]   # Publication date
     pdf_url: str               # Direct PDF link
     url: str                   # URL to paper page
-    source: str                # Source platform (e.g., 'arxiv', 'pubmed')
+    source: str                # Source platform (e.g., 'arxiv', 'core')
 
     # 可选字段
     updated_date: Optional[datetime] = None        # Last updated date

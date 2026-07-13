@@ -47,11 +47,11 @@ class TestCrossRefSearcher(unittest.TestCase):
         if not self.api_accessible:
             self.skipTest("CrossRef API is not accessible")
             
-        # Test search with date filter
+        # Test search with the public year parameter
         papers = self.searcher.search(
             "artificial intelligence", 
             max_results=3,
-            filter="from-pub-date:2020,has-full-text:true"
+            year="2020-"
         )
         print(f"Found {len(papers)} papers with filters")
         self.assertTrue(len(papers) >= 0)  # May return 0 if no papers match filters
@@ -92,9 +92,8 @@ class TestCrossRefSearcher(unittest.TestCase):
         self.assertIn("metadata and abstracts are available", message)
 
     def test_search_error_handling(self):
-        # Test with invalid search parameters to check error handling
-        papers = self.searcher.search("", max_results=0)  # Empty query
-        self.assertEqual(len(papers), 0)
+        with self.assertRaises(ValueError):
+            self.searcher.search("", max_results=0)
 
     def test_user_agent_header(self):
         # Test that the session has the correct user agent

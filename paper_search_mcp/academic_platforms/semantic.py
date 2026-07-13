@@ -21,6 +21,30 @@ class SemanticSearcher(PaperSource):
 
     SEMANTIC_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
     SEMANTIC_BASE_URL = "https://api.semanticscholar.org/graph/v1"
+    FINANCE_FIELDS = "Business,Economics"
+    RELEVANCE_PAGE_SIZE = 100
+    RELEVANCE_MAX_RESULTS = 1_000
+    AUTHOR_PAGE_SIZE = 1_000
+    PAPER_FIELDS = ",".join(
+        [
+            "title",
+            "abstract",
+            "year",
+            "citationCount",
+            "authors",
+            "url",
+            "publicationDate",
+            "externalIds",
+            "fieldsOfStudy",
+            "s2FieldsOfStudy",
+            "openAccessPdf",
+            "publicationTypes",
+        ]
+    )
+    YEAR_ERROR = (
+        "year must use one of: YYYY, YYYY-YYYY, YYYY-, or -YYYY "
+        '(for example: "2024", "2020-2024", "2020-", "-2020")'
+    )
     BROWSERS = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
@@ -73,20 +97,10 @@ class SemanticSearcher(PaperSource):
         if doi_urls:
             return doi_urls[0]
 
-        non_unpaywall_urls = [url for url in all_urls if "unpaywall.org" not in url]
-        if non_unpaywall_urls:
-            url = non_unpaywall_urls[0]
-            if "arxiv.org/abs/" in url:
-                pdf_url = url.replace("/abs/", "/pdf/")
-                return pdf_url
-            return url
-
-        if all_urls:
-            url = all_urls[0]
-            if "arxiv.org/abs/" in url:
-                pdf_url = url.replace("/abs/", "/pdf/")
-                return pdf_url
-            return url
+        url = all_urls[0]
+        if "arxiv.org/abs/" in url:
+            return url.replace("/abs/", "/pdf/")
+        return url
 
         return ""
 
@@ -122,7 +136,11 @@ class SemanticSearcher(PaperSource):
             # Safely get categories
             categories = item.get("fieldsOfStudy", [])
             if not categories:
-                categories = []
+                categories = [
+                    field.get("category", "")
+                    for field in (item.get("s2FieldsOfStudy") or [])
+                    if isinstance(field, dict) and field.get("category")
+                ]
             elif not isinstance(categories, list):
                 categories = [categories] if categories else []
 
@@ -264,97 +282,281 @@ class SemanticSearcher(PaperSource):
             "message": "Maximum retry attempts exceeded",
         }
 
+    @staticmethod
+    def _normalize_text(value: str, field_name: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        normalized = " ".join(value.strip().split())
+        if not normalized:
+            raise ValueError(f"{field_name} must not be empty")
+        return normalized
+
+    @classmethod
+    def _validate_year(cls, year: Optional[str]) -> Optional[str]:
+        if year is None:
+            return None
+        if not isinstance(year, str):
+            raise ValueError(cls.YEAR_ERROR)
+        value = year.strip()
+        single = re.fullmatch(r"(\d{4})", value)
+        closed = re.fullmatch(r"(\d{4})-(\d{4})", value)
+        since = re.fullmatch(r"(\d{4})-", value)
+        until = re.fullmatch(r"-(\d{4})", value)
+        if closed and int(closed.group(1)) > int(closed.group(2)):
+            raise ValueError("year start must not be greater than year end")
+        if not any((single, closed, since, until)):
+            raise ValueError(cls.YEAR_ERROR)
+        return value
+
+    @staticmethod
+    def _validate_max_results(max_results: int) -> None:
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+            raise ValueError("max_results must be a positive integer")
+
+    @staticmethod
+    def _validate_sort(sorted_by: str) -> str:
+        if sorted_by not in {"relevance", "date", "recency"}:
+            raise ValueError(
+                "Semantic Scholar sorted_by must be one of: relevance, date, recency"
+            )
+        return "relevance" if sorted_by == "recency" else sorted_by
+
+    def _get_json(self, path: str, params: dict) -> dict:
+        response = self.request_api(path, params)
+        if isinstance(response, dict) and "error" in response:
+            status = response.get("status_code", "unknown")
+            message = response.get("message", response["error"])
+            raise RuntimeError(
+                f"Semantic Scholar API request failed (status={status}): {message}"
+            )
+        if not hasattr(response, "status_code") or response.status_code != 200:
+            status = getattr(response, "status_code", "unknown")
+            raise RuntimeError(f"Semantic Scholar API request failed (status={status})")
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError("Semantic Scholar returned an invalid JSON response") from exc
+
+    def _parse_results(self, items: List[dict], remaining: int) -> List[Paper]:
+        papers: List[Paper] = []
+        for item in items:
+            if len(papers) >= remaining:
+                break
+            paper = self._parse_paper(item)
+            if paper:
+                papers.append(paper)
+        return papers
+
+    def _search_relevance(
+        self, query: str, year: Optional[str], max_results: int
+    ) -> List[Paper]:
+        papers: List[Paper] = []
+        offset = 0
+        while len(papers) < max_results and offset < self.RELEVANCE_MAX_RESULTS:
+            limit = min(
+                self.RELEVANCE_PAGE_SIZE,
+                max_results - len(papers),
+                self.RELEVANCE_MAX_RESULTS - offset,
+            )
+            params = {
+                "query": query,
+                "fields": self.PAPER_FIELDS,
+                "fieldsOfStudy": self.FINANCE_FIELDS,
+                "limit": limit,
+                "offset": offset,
+            }
+            if year is not None:
+                params["year"] = year
+            payload = self._get_json("paper/search", params)
+            results = payload.get("data", [])
+            if not results:
+                break
+            papers.extend(self._parse_results(results, max_results - len(papers)))
+            if len(results) < limit or payload.get("next") is None:
+                break
+            offset = int(payload["next"])
+        return papers[:max_results]
+
+    def _search_bulk(
+        self,
+        query: str,
+        year: Optional[str],
+        max_results: int,
+        sort_by_date: bool,
+    ) -> List[Paper]:
+        papers: List[Paper] = []
+        token: Optional[str] = None
+        while len(papers) < max_results:
+            params = {
+                "query": query,
+                "fields": self.PAPER_FIELDS,
+                "fieldsOfStudy": self.FINANCE_FIELDS,
+            }
+            if year is not None:
+                params["year"] = year
+            if sort_by_date:
+                params["sort"] = "publicationDate:desc"
+            if token is not None:
+                params["token"] = token
+            payload = self._get_json("paper/search/bulk", params)
+            results = payload.get("data", [])
+            if not results:
+                break
+            papers.extend(self._parse_results(results, max_results - len(papers)))
+            token = payload.get("token")
+            if not token:
+                break
+        return papers[:max_results]
+
+    @classmethod
+    def _year_bounds(cls, year: Optional[str]) -> tuple[Optional[int], Optional[int]]:
+        if year is None:
+            return None, None
+        if re.fullmatch(r"\d{4}", year):
+            value = int(year)
+            return value, value
+        start, end = year.split("-", 1)
+        return (int(start) if start else None, int(end) if end else None)
+
+    @classmethod
+    def _matches_author_filters(
+        cls,
+        item: dict,
+        query: str,
+        year: Optional[str],
+    ) -> bool:
+        searchable = f"{item.get('title') or ''} {item.get('abstract') or ''}".casefold()
+        if not all(term.casefold() in searchable for term in query.split()):
+            return False
+
+        categories = {
+            str(category).casefold() for category in (item.get("fieldsOfStudy") or [])
+        }
+        categories.update(
+            str(field.get("category", "")).casefold()
+            for field in (item.get("s2FieldsOfStudy") or [])
+            if isinstance(field, dict)
+        )
+        if not categories.intersection({"business", "economics"}):
+            return False
+
+        start, end = cls._year_bounds(year)
+        paper_year = item.get("year")
+        if start is not None or end is not None:
+            if not isinstance(paper_year, int):
+                return False
+            if start is not None and paper_year < start:
+                return False
+            if end is not None and paper_year > end:
+                return False
+        return True
+
+    @staticmethod
+    def _author_relevance_key(item: dict, query: str) -> tuple[int, int]:
+        title = str(item.get("title") or "").casefold()
+        abstract = str(item.get("abstract") or "").casefold()
+        score = sum(title.count(term.casefold()) * 2 for term in query.split())
+        score += sum(abstract.count(term.casefold()) for term in query.split())
+        return score, int(item.get("citationCount") or 0)
+
+    @staticmethod
+    def _author_date_key(item: dict) -> tuple[str, int]:
+        return str(item.get("publicationDate") or ""), int(item.get("year") or 0)
+
+    def _search_author(
+        self,
+        author: str,
+        query: str,
+        year: Optional[str],
+        max_results: int,
+        sorted_by: str,
+    ) -> List[Paper]:
+        author_payload = self._get_json(
+            "author/search", {"query": author, "limit": 10, "fields": "name,paperCount"}
+        )
+        candidates = author_payload.get("data", [])
+        if not candidates:
+            return []
+        exact = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("name") or "").casefold() == author.casefold()
+        ]
+        selected = (exact or candidates)[0]
+        author_id = selected.get("authorId")
+        if not author_id:
+            return []
+
+        items: List[dict] = []
+        offset = 0
+        while True:
+            payload = self._get_json(
+                f"author/{author_id}/papers",
+                {
+                    "fields": self.PAPER_FIELDS,
+                    "limit": self.AUTHOR_PAGE_SIZE,
+                    "offset": offset,
+                },
+            )
+            batch = payload.get("data", [])
+            if not batch:
+                break
+            items.extend(
+                item
+                for item in batch
+                if self._matches_author_filters(item, query=query, year=year)
+            )
+            next_offset = payload.get("next")
+            if next_offset is None:
+                break
+            offset = int(next_offset)
+
+        if sorted_by == "date":
+            items.sort(key=self._author_date_key, reverse=True)
+        else:
+            items.sort(
+                key=lambda item: self._author_relevance_key(item, query), reverse=True
+            )
+        return self._parse_results(items, max_results)
+
     def search(
         self,
         query: str,
         year: Optional[str] = None,
         max_results: int = 10,
+        sorted_by: str = "relevance",
+        author: Optional[str] = None,
         fetch_details: bool = False,
     ) -> List[Paper]:
-        """
-        Search Semantic Scholar
+        """Search Semantic Scholar using relevance, bulk, or author workflows."""
+        del fetch_details  # Retained only for backward compatibility.
+        normalized_query = self._normalize_text(query, "query")
+        normalized_year = self._validate_year(year)
+        self._validate_max_results(max_results)
+        effective_sort = self._validate_sort(sorted_by)
 
-        Args:
-            query: Search query string
-            year (Optional[str]): Filter by publication year. Supports several formats:
-            - Single year: "2019"
-            - Year range: "2016-2020"
-            - Since year: "2010-"
-            - Until year: "-2015"
-            max_results: Maximum number of results to return
-            fetch_details: Backward-compatible flag retained for older callers.
-                Semantic search responses already include the fields this connector uses,
-                so the current implementation does not perform extra per-paper detail fetches.
-
-        Returns:
-            List[Paper]: List of paper objects
-        """
-        papers = []
-
-        try:
-            fields = [
-                "title",
-                "abstract",
-                "year",
-                "citationCount",
-                "authors",
-                "url",
-                "publicationDate",
-                "externalIds",
-                "fieldsOfStudy",
-                "openAccessPdf",
-            ]
-            # Construct search parameters
-            params = {
-                "query": query,
-                "limit": max_results,
-                "fields": ",".join(fields),
-            }
-            if year:
-                params["year"] = year
-            # Make request
-            response = self.request_api("paper/search", params)
-
-            # Check for errors
-            if isinstance(response, dict) and "error" in response:
-                error_msg = response.get("message", "Unknown error")
-                if response.get("error") == "rate_limited":
-                    logger.error(f"Rate limited by Semantic Scholar API: {error_msg}")
-                else:
-                    logger.error(f"Semantic Scholar API error: {error_msg}")
-                return papers
-
-            # Check response status code
-            if not hasattr(response, "status_code") or response.status_code != 200:
-                status_code = getattr(response, "status_code", "unknown")
-                logger.error(
-                    f"Semantic Scholar search failed with status {status_code}"
-                )
-                return papers
-
-            data = response.json()
-            results = data["data"]
-
-            if not results:
-                logger.info("No results found for the query")
-                return papers
-
-            # Process each result
-            for i, item in enumerate(results):
-                if len(papers) >= max_results:
-                    break
-
-                logger.info(
-                    f"Processing paper {i + 1}/{min(len(results), max_results)}"
-                )
-                paper = self._parse_paper(item)
-                if paper:
-                    papers.append(paper)
-
-        except Exception as e:
-            logger.error(f"Semantic Scholar search error: {e}")
-
-        return papers[:max_results]
+        if author is not None:
+            normalized_author = self._normalize_text(author, "author")
+            return self._search_author(
+                normalized_author,
+                normalized_query,
+                normalized_year,
+                max_results,
+                effective_sort,
+            )
+        if effective_sort == "date":
+            return self._search_bulk(
+                normalized_query, normalized_year, max_results, sort_by_date=True
+            )
+        if max_results > self.RELEVANCE_MAX_RESULTS:
+            logger.warning(
+                "Semantic Scholar relevance search is limited to 1000 results; "
+                "switching to bulk retrieval without relevance ranking."
+            )
+            return self._search_bulk(
+                normalized_query, normalized_year, max_results, sort_by_date=False
+            )
+        return self._search_relevance(normalized_query, normalized_year, max_results)
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:
         """
@@ -368,7 +570,6 @@ class SemanticSearcher(PaperSource):
             - MAG:<id> (e.g., "MAG:112218234")
             - ACL:<id> (e.g., "ACL:W12-3903")
             - PMID:<id> (e.g., "PMID:19872477")
-            - PMCID:<id> (e.g., "PMCID:2323736")
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
             save_path: Path to save the PDF
 
@@ -408,7 +609,6 @@ class SemanticSearcher(PaperSource):
             - MAG:<id> (e.g., "MAG:112218234")
             - ACL:<id> (e.g., "ACL:W12-3903")
             - PMID:<id> (e.g., "PMID:19872477")
-            - PMCID:<id> (e.g., "PMCID:2323736")
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
             save_path: Directory to save downloaded PDF
 
@@ -483,7 +683,6 @@ class SemanticSearcher(PaperSource):
             - MAG:<id> (e.g., "MAG:112218234")
             - ACL:<id> (e.g., "ACL:W12-3903")
             - PMID:<id> (e.g., "PMID:19872477")
-            - PMCID:<id> (e.g., "PMCID:2323736")
             - URL:<url> (e.g., "URL:https://arxiv.org/abs/2106.15928v1")
 
         Returns:

@@ -1,94 +1,225 @@
 # paper_search_mcp/academic_platforms/crossref.py
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-import requests
+import logging
+import re
 import time
-import random
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from ..config import get_env
 from ..paper import Paper
 from .base import PaperSource
-import logging
 
 logger = logging.getLogger(__name__)
 
+
+CROSSREF_FINANCE_QUERY = (
+    "finance financial economics econometrics "
+    "asset pricing corporate finance banking "
+    "investment securities portfolio derivatives "
+    "risk management market microstructure fintech"
+)
+
+CROSSREF_SORT_MAP = {
+    "relevance": "relevance",
+    "date": "published",
+    "recency": "updated",
+}
+
+
 class CrossRefSearcher(PaperSource):
-    """Searcher for CrossRef database papers"""
-    
+    """Search finance-related metadata through the Crossref Works API."""
+
     BASE_URL = "https://api.crossref.org"
-    
-    # User agent for polite API usage as per CrossRef etiquette
-    USER_AGENT = "paper-search-mcp/0.1.3 (https://github.com/Dragonatorul/paper-search-mcp; mailto:paper-search@example.org)"
-    
-    def __init__(self):
+    WORKS_URL = f"{BASE_URL}/works"
+    MAX_ROWS = 1000
+    DEFAULT_MAILTO = "paper-search@example.org"
+    YEAR_ERROR = (
+        "year must use one of: YYYY, YYYY-YYYY, YYYY-, or -YYYY "
+        '(for example: "2024", "2020-2024", "2020-", "-2020")'
+    )
+
+    def __init__(self, mailto: Optional[str] = None):
+        self.mailto = (
+            mailto
+            if mailto is not None
+            else get_env("CROSSREF_MAILTO", self.DEFAULT_MAILTO)
+        ).strip()
+        if not self.mailto:
+            self.mailto = self.DEFAULT_MAILTO
+        user_agent = (
+            "paper-search-mcp/1.0 "
+            "(https://github.com/Dragonatorul/paper-search-mcp; "
+            f"mailto:{self.mailto})"
+        )
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': self.USER_AGENT,
+            'User-Agent': user_agent,
             'Accept': 'application/json'
         })
-    
-    def search(self, query: str, max_results: int = 10, **kwargs) -> List[Paper]:
-        """
-        Search CrossRef database for papers.
-        
-        Args:
-            query: Search query string
-            max_results: Maximum number of results to return (default: 10)
-            **kwargs: Additional parameters like filters, sort, etc.
-            
-        Returns:
-            List of Paper objects
-        """
+
+    @staticmethod
+    def _normalize_query(value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("query must be a string")
+        query = value.strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        return query
+
+    @staticmethod
+    def _normalize_author(value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("author must be a string")
+        normalized = " ".join(value.strip().split())
+        if len(normalized) >= 2 and normalized[0] == normalized[-1] == '"':
+            normalized = " ".join(normalized[1:-1].strip().split())
+        if not normalized:
+            raise ValueError("author must not be empty")
+        return normalized
+
+    @classmethod
+    def _build_year_filter(cls, year: str) -> str:
+        if not isinstance(year, str):
+            raise ValueError(cls.YEAR_ERROR)
+        value = year.strip()
+        single = re.fullmatch(r"(\d{4})", value)
+        closed = re.fullmatch(r"(\d{4})-(\d{4})", value)
+        since = re.fullmatch(r"(\d{4})-", value)
+        until = re.fullmatch(r"-(\d{4})", value)
+
+        if single:
+            year_value = single.group(1)
+            return (
+                f"from-pub-date:{year_value}-01-01,"
+                f"until-pub-date:{year_value}-12-31"
+            )
+        if closed:
+            start_year, end_year = int(closed.group(1)), int(closed.group(2))
+            if start_year > end_year:
+                raise ValueError("year start must not be greater than year end")
+            return (
+                f"from-pub-date:{start_year:04d}-01-01,"
+                f"until-pub-date:{end_year:04d}-12-31"
+            )
+        if since:
+            return f"from-pub-date:{since.group(1)}-01-01"
+        if until:
+            return f"until-pub-date:{until.group(1)}-12-31"
+        raise ValueError(cls.YEAR_ERROR)
+
+    @staticmethod
+    def _validate_max_results(max_results: int) -> None:
+        if (
+            isinstance(max_results, bool)
+            or not isinstance(max_results, int)
+            or max_results < 1
+        ):
+            raise ValueError("max_results must be a positive integer")
+
+    @staticmethod
+    def _map_sort(sorted_by: str) -> str:
         try:
-            params = {
-                'query': query,
-                'rows': min(max_results, 1000),  # CrossRef API max is 1000
-                'sort': 'relevance',
-                'order': 'desc'
-            }
-            
-            # Add any additional filters from kwargs
-            if 'filter' in kwargs:
-                params['filter'] = kwargs['filter']
-            if 'sort' in kwargs:
-                params['sort'] = kwargs['sort']
-            if 'order' in kwargs:
-                params['order'] = kwargs['order']
-                
-            # Add polite pool parameter
-            params['mailto'] = 'paper-search@example.org'
-            
-            url = f"{self.BASE_URL}/works"
-            response = self.session.get(url, params=params, timeout=30)
-            
+            return CROSSREF_SORT_MAP[sorted_by]
+        except (KeyError, TypeError):
+            raise ValueError(
+                "Crossref sorted_by must be one of: relevance, date, recency"
+            ) from None
+
+    def _request_json(self, params: Dict[str, Any]) -> dict:
+        response = None
+        try:
+            response = self.session.get(self.WORKS_URL, params=params, timeout=30)
             if response.status_code == 429:
-                # Rate limited - wait and retry once
-                logger.warning("Rate limited by CrossRef API, waiting 2 seconds...")
+                logger.warning("Rate limited by Crossref API; retrying in 2 seconds")
                 time.sleep(2)
-                response = self.session.get(url, params=params, timeout=30)
-            
+                response = self.session.get(self.WORKS_URL, params=params, timeout=30)
             response.raise_for_status()
-            data = response.json()
-            
-            papers = []
-            items = data.get('message', {}).get('items', [])
-            
+            return response.json()
+        except requests.RequestException as exc:
+            status = getattr(response, "status_code", None)
+            detail = ""
+            if response is not None:
+                try:
+                    payload = response.json()
+                    detail = str(payload.get("message") or payload.get("status") or "")
+                except ValueError:
+                    detail = response.text[:300]
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(
+                f"Crossref API request failed (status={status}){suffix}"
+            ) from exc
+        except ValueError as exc:
+            raise RuntimeError("Crossref returned an invalid JSON response") from exc
+
+    def _base_search_params(
+        self,
+        query: str,
+        sorted_by: str,
+        year: Optional[str],
+        author: Optional[str],
+    ) -> Dict[str, Any]:
+        params: Dict[str, Any] = {
+            "query": self._normalize_query(query),
+            "query.bibliographic": CROSSREF_FINANCE_QUERY,
+            "sort": self._map_sort(sorted_by),
+            "order": "desc",
+            "mailto": self.mailto,
+        }
+        if author is not None:
+            params["query.author"] = self._normalize_author(author)
+        if year is not None:
+            params["filter"] = self._build_year_filter(year)
+        return params
+
+    def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        sorted_by: str = "relevance",
+        year: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> List[Paper]:
+        """Search Crossref using native fields and cursor pagination."""
+        self._validate_max_results(max_results)
+        base_params = self._base_search_params(query, sorted_by, year, author)
+        use_cursor = max_results > self.MAX_ROWS
+        cursor: Optional[str] = "*" if use_cursor else None
+        papers: List[Paper] = []
+
+        while len(papers) < max_results:
+            rows = min(self.MAX_ROWS, max_results - len(papers))
+            params = {**base_params, "rows": rows}
+            if cursor is not None:
+                params["cursor"] = cursor
+
+            data = self._request_json(params)
+            message = data.get("message") or {}
+            items = message.get("items") or []
+            if not items:
+                break
+
             for item in items:
+                if len(papers) >= max_results:
+                    break
                 try:
                     paper = self._parse_crossref_item(item)
                     if paper:
                         papers.append(paper)
-                except Exception as e:
-                    logger.warning(f"Error parsing CrossRef item: {e}")
+                except Exception as exc:
+                    logger.warning("Error parsing Crossref item: %s", exc)
                     continue
-                    
-            return papers
-            
-        except requests.RequestException as e:
-            logger.error(f"Error searching CrossRef: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Unexpected error in CrossRef search: {e}")
-            return []
-    
+
+            if not use_cursor or len(items) < rows:
+                break
+            next_cursor = message.get("next-cursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = next_cursor
+
+        return papers[:max_results]
+
     def _parse_crossref_item(self, item: Dict[str, Any]) -> Optional[Paper]:
         """Parse a CrossRef API item into a Paper object."""
         try:
@@ -275,7 +406,7 @@ class CrossRefSearcher(PaperSource):
         """
         try:
             url = f"{self.BASE_URL}/works/{doi}"
-            params = {'mailto': 'paper-search@example.org'}
+            params = {'mailto': self.mailto}
             
             response = self.session.get(url, params=params, timeout=30)
             

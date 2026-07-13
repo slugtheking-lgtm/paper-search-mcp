@@ -16,8 +16,11 @@ def _candidate_env_files() -> list[Path]:
     if explicit_path:
         return [Path(explicit_path).expanduser()]
 
+    project_root = Path(__file__).resolve().parent.parent
+    project_env = project_root / ".env"
+    project_env_example = project_root / ".env.example"
     user_config_env = Path.home() / ".config" / "paper-search-mcp" / ".env"
-    return [user_config_env]
+    return [project_env, project_env_example, user_config_env]
 
 
 def _strip_quotes(value: str) -> str:

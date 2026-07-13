@@ -1,51 +1,128 @@
-# tests/test_server.py
 import unittest
-import asyncio
-import os
+from unittest.mock import AsyncMock, patch
+
 from paper_search_mcp import server
+from paper_search_mcp import cli
+from paper_search_mcp.cli import build_parser
 
-class TestPaperSearchServer(unittest.TestCase):
-    def test_all_sources_include_new_platforms(self):
-        self.assertIn("dblp", server.ALL_SOURCES)
-        self.assertIn("openaire", server.ALL_SOURCES)
-        self.assertIn("citeseerx", server.ALL_SOURCES)
-        self.assertIn("doaj", server.ALL_SOURCES)
-        self.assertIn("base", server.ALL_SOURCES)
-        self.assertIn("zenodo", server.ALL_SOURCES)
-        self.assertIn("hal", server.ALL_SOURCES)
-        self.assertIn("ssrn", server.ALL_SOURCES)
-        self.assertIn("unpaywall", server.ALL_SOURCES)
 
-    def test_parse_sources_with_new_platforms(self):
-        parsed = server._parse_sources("dblp,doaj,base,zenodo,hal,ssrn,unpaywall,invalid")
-        self.assertEqual(parsed, ["dblp", "doaj", "base", "zenodo", "hal", "ssrn", "unpaywall"])
+class TestServerSources(unittest.TestCase):
+    def test_only_requested_sources_are_registered(self):
+        self.assertEqual(
+            server.ALL_SOURCES,
+            ["arxiv", "core", "doaj", "semantic", "openalex", "crossref"],
+        )
 
-    def test_search_arxiv(self):
-        """Test the search_arxiv tool returns 10 results."""
-        result = asyncio.run(server.search_arxiv("machine learning", max_results=10))
-        self.assertIsInstance(result, list, "Result should be a list")
-        self.assertEqual(len(result), 10, "Should return exactly 10 results")
-        for paper in result:
-            self.assertIn('title', paper, "Each result should contain a title")
-            self.assertIn('paper_id', paper, "Each result should contain a paper_id")
+    def test_source_parser_rejects_removed_sources(self):
+        self.assertEqual(server._parse_sources("arxiv,removed_source,doaj"), ["arxiv", "doaj"])
 
-    def test_download_arxiv_from_search(self):
-        """Test downloading 10 arXiv papers based on search results."""
-        # 先搜索 10 个结果
-        search_results = asyncio.run(server.search_arxiv("machine learning", max_results=10))
-        self.assertEqual(len(search_results), 10, "Search should return 10 results")
+    def test_cli_exposes_common_search_parameters(self):
+        args = build_parser().parse_args(
+            [
+                "search", "momentum factor", "-y", "2020-2024",
+                "-s", "arxiv", "-n", "25", "-sort", "date",
+                "-au", "Clifford Asness",
+            ]
+        )
+        self.assertEqual(args.query, "momentum factor")
+        self.assertEqual(args.year, "2020-2024")
+        self.assertEqual(args.sources, "arxiv")
+        self.assertEqual(args.max_results, 25)
+        self.assertEqual(args.sorted_by, "date")
+        self.assertEqual(args.author, "Clifford Asness")
 
-        # 下载目录
-        save_path = "./downloads"
-        os.makedirs(save_path, exist_ok=True)  # 确保目录存在
 
-        # 下载每个搜索结果的 PDF
-        for paper in search_results:
-            paper_id = paper['paper_id']
-            result = asyncio.run(server.download_arxiv(paper_id, save_path))
-            self.assertIsInstance(result, str, f"Result for {paper_id} should be a file path")
-            self.assertTrue(result.endswith(".pdf"), f"Result for {paper_id} should be a PDF file path")
-            self.assertTrue(os.path.exists(result), f"PDF file for {paper_id} should exist on disk")
+class TestOpenAlexPublicDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_unified_search_forwards_common_parameters(self):
+        with patch.object(server, "async_search", new=AsyncMock(return_value=[])) as search:
+            result = await server.search_papers(
+                "momentum factor",
+                year="2020-2026",
+                sources="openalex",
+                max_results=250,
+                sorted_by="date",
+                author="Clifford Asness",
+            )
+
+        search.assert_awaited_once_with(
+            server.SEARCHERS["openalex"],
+            "momentum factor",
+            250,
+            sorted_by="date",
+            year="2020-2026",
+            author="Clifford Asness",
+        )
+        self.assertEqual(result["sources_used"], ["openalex"])
+
+    async def test_cli_search_forwards_common_parameters(self):
+        openalex_searcher = object()
+        args = build_parser().parse_args(
+            [
+                "search", "momentum factor", "-s", "openalex", "-y", "2020-2026",
+                "-n", "250", "-sort", "recency", "-au", "Clifford Asness",
+            ]
+        )
+        with patch.dict(cli.SEARCHERS, {"openalex": openalex_searcher}, clear=True), patch.object(
+            cli, "_async_search", new=AsyncMock(return_value=[])
+        ) as search, patch("builtins.print"):
+            exit_code = await cli.cmd_search(args)
+
+        self.assertEqual(exit_code, 0)
+        search.assert_awaited_once_with(
+            openalex_searcher,
+            "momentum factor",
+            250,
+            sorted_by="recency",
+            year="2020-2026",
+            author="Clifford Asness",
+        )
+
+
+class TestCrossrefPublicDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_unified_search_forwards_common_parameters(self):
+        with patch.object(server, "async_search", new=AsyncMock(return_value=[])) as search:
+            result = await server.search_papers(
+                "momentum factor",
+                year="2020-2026",
+                sources="crossref",
+                max_results=2500,
+                sorted_by="date",
+                author="Clifford Asness",
+            )
+
+        search.assert_awaited_once_with(
+            server.SEARCHERS["crossref"],
+            "momentum factor",
+            2500,
+            sorted_by="date",
+            year="2020-2026",
+            author="Clifford Asness",
+        )
+        self.assertEqual(result["sources_used"], ["crossref"])
+
+    async def test_cli_search_forwards_common_parameters(self):
+        crossref_searcher = object()
+        args = build_parser().parse_args(
+            [
+                "search", "momentum factor", "-s", "crossref", "-y", "2020-2026",
+                "-n", "2500", "-sort", "recency", "-au", "Clifford Asness",
+            ]
+        )
+        with patch.dict(cli.SEARCHERS, {"crossref": crossref_searcher}, clear=True), patch.object(
+            cli, "_async_search", new=AsyncMock(return_value=[])
+        ) as search, patch("builtins.print"):
+            exit_code = await cli.cmd_search(args)
+
+        self.assertEqual(exit_code, 0)
+        search.assert_awaited_once_with(
+            crossref_searcher,
+            "momentum factor",
+            2500,
+            sorted_by="recency",
+            year="2020-2026",
+            author="Clifford Asness",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

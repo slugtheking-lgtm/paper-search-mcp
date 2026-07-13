@@ -5,6 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
+import re
 import time
 from ..paper import Paper
 from ..utils import extract_doi
@@ -14,12 +15,44 @@ from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
 
+CORE_FINANCE_FILTER = (
+    "("
+    'fieldOfStudy:"Finance" OR '
+    'fieldOfStudy:"Economics" OR '
+    'fieldOfStudy:"Business" OR '
+    '"financial economics" OR '
+    '"financial markets" OR '
+    '"asset pricing" OR '
+    '"corporate finance" OR '
+    '"portfolio management" OR '
+    '"capital markets" OR '
+    '"banking" OR '
+    '"investment" OR '
+    '"securities" OR '
+    '"derivatives" OR '
+    '"risk management" OR '
+    '"market microstructure" OR '
+    '"behavioral finance" OR '
+    '"fintech"'
+    ")"
+)
+
 
 class CORESearcher(PaperSource):
     """Searcher for CORE (global open access research papers)"""
 
     BASE_URL = "https://api.core.ac.uk/v3"
+    PAGE_SIZE = 100
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    SORT_BY = {
+        "relevance": "relevance",
+        "date": "recency",
+        "recency": "recency",
+    }
+    YEAR_ERROR = (
+        "year must use one of: YYYY, YYYY-YYYY, YYYY-, or -YYYY "
+        '(for example: "2024", "2020-2024", "2020-", "-2020")'
+    )
 
     def __init__(self, api_key: Optional[str] = None):
         """
@@ -39,124 +72,169 @@ class CORESearcher(PaperSource):
         else:
             logger.warning("No CORE API key provided. Searches may be rate-limited or return limited results.")
 
-    def search(self, query: str, max_results: int = 10, **kwargs) -> List[Paper]:
-        """
-        Search CORE for open access research papers.
+    @staticmethod
+    def _normalize_phrase(value: str, field_name: str) -> str:
+        """Normalize user input as a literal CORE phrase."""
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        phrase = " ".join(value.strip().split())
+        if len(phrase) >= 2 and phrase.startswith('"') and phrase.endswith('"'):
+            phrase = " ".join(phrase[1:-1].strip().split())
+        if not phrase:
+            raise ValueError(f"{field_name} must not be empty")
+        if '"' in phrase:
+            raise ValueError(
+                f"{field_name} must be plain text and must not contain embedded double quotes"
+            )
+        return f'"{phrase}"'
 
-        Args:
-            query: Search query string
-            max_results: Maximum results to return (CORE API default: 10, max: 100)
-            **kwargs: Additional parameters:
-                - year: Filter by year
-                - language: Filter by language (e.g., 'en')
-                - repository: Filter by repository
-                - has_fulltext: Filter by full text availability (True/False)
+    @classmethod
+    def _build_year_conditions(cls, year: str) -> List[str]:
+        """Compile a public year expression to CORE yearPublished conditions."""
+        if not isinstance(year, str):
+            raise ValueError(cls.YEAR_ERROR)
+        value = year.strip()
+        single = re.fullmatch(r"(\d{4})", value)
+        closed = re.fullmatch(r"(\d{4})-(\d{4})", value)
+        since = re.fullmatch(r"(\d{4})-", value)
+        until = re.fullmatch(r"-(\d{4})", value)
 
-        Returns:
-            List[Paper]: List of found papers with metadata
-        """
-        papers = []
+        if single:
+            return [f"yearPublished:{single.group(1)}"]
+        if closed:
+            start_year, end_year = int(closed.group(1)), int(closed.group(2))
+            if start_year > end_year:
+                raise ValueError("year start must not be greater than year end")
+            return [
+                f'yearPublished>="{start_year:04d}"',
+                f'yearPublished<="{end_year:04d}"',
+            ]
+        if since:
+            return [f'yearPublished>="{since.group(1)}"']
+        if until:
+            return [f'yearPublished<="{until.group(1)}"']
+        raise ValueError(cls.YEAR_ERROR)
 
+    @classmethod
+    def _build_search_query(
+        cls,
+        query: str,
+        year: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> str:
+        parts = [cls._normalize_phrase(query, "query")]
+        if author is not None:
+            parts.append(f'authors:{cls._normalize_phrase(author, "author")}')
+        if year is not None:
+            parts.extend(cls._build_year_conditions(year))
+        parts.append(CORE_FINANCE_FILTER)
+        return " AND ".join(parts)
+
+    @staticmethod
+    def _validate_max_results(max_results: int) -> None:
+        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
+            raise ValueError("max_results must be a positive integer")
+
+    @classmethod
+    def _map_sort(cls, sorted_by: str) -> str:
         try:
-            # Prepare search parameters
-            params = {
-                'q': query,
-                'limit': min(max_results, 100),  # CORE API max limit is 100
-                'offset': 0,
-            }
+            return cls.SORT_BY[sorted_by]
+        except (KeyError, TypeError):
+            raise ValueError("CORE sorted_by must be one of: relevance, date, recency") from None
 
-            # Add optional filters
-            if 'year' in kwargs:
-                params['year'] = kwargs['year']
-            if 'language' in kwargs:
-                params['language'] = kwargs['language']
-            if 'repository' in kwargs:
-                params['repository'] = kwargs['repository']
-            if 'has_fulltext' in kwargs:
-                params['has_fulltext'] = str(kwargs['has_fulltext']).lower()
-
-            # Add other supported parameters
-            supported_params = ['publishedAfter', 'publishedBefore', 'doi', 'issn', 'isbn']
-            for param in supported_params:
-                if param in kwargs:
-                    params[param] = kwargs[param]
-
-            response = None
-            for attempt in range(3):
-                try:
-                    candidate = self.session.get(f"{self.BASE_URL}/search/works", params=params, timeout=30)
-
-                    if candidate.status_code in self.RETRYABLE_STATUS_CODES:
-                        wait_seconds = min(8, 2 ** attempt)
-                        logger.warning(
-                            "CORE request returned %s (attempt %s/3). Retrying in %ss",
-                            candidate.status_code,
-                            attempt + 1,
-                            wait_seconds,
-                        )
-                        time.sleep(wait_seconds)
-                        continue
-
-                    if candidate.status_code in {401, 403} and self.api_key:
-                        logger.warning(
-                            "CORE API key was rejected (status=%s). Retrying once without key.",
-                            candidate.status_code,
-                        )
-                        fallback_headers = {
-                            'User-Agent': self.session.headers.get('User-Agent', ''),
-                            'Accept': self.session.headers.get('Accept', 'application/json'),
-                        }
-                        candidate = requests.get(
-                            f"{self.BASE_URL}/search/works",
-                            params=params,
-                            headers=fallback_headers,
-                            timeout=30,
-                        )
-
-                    candidate.raise_for_status()
-                    response = candidate
-                    break
-                except requests.Timeout:
+    def _request_page(self, params: Dict[str, Any]):
+        response = None
+        for attempt in range(3):
+            try:
+                candidate = self.session.get(
+                    f"{self.BASE_URL}/search/works", params=params, timeout=30
+                )
+                if candidate.status_code in self.RETRYABLE_STATUS_CODES:
                     wait_seconds = min(8, 2 ** attempt)
                     logger.warning(
-                        "CORE request timed out (attempt %s/3). Retrying in %ss",
-                        attempt + 1,
-                        wait_seconds,
+                        "CORE request returned %s (attempt %s/3). Retrying in %ss",
+                        candidate.status_code, attempt + 1, wait_seconds,
                     )
                     time.sleep(wait_seconds)
+                    continue
+                if candidate.status_code in {401, 403} and self.api_key:
+                    logger.warning(
+                        "CORE API key was rejected (status=%s). Retrying once without key.",
+                        candidate.status_code,
+                    )
+                    candidate = requests.get(
+                        f"{self.BASE_URL}/search/works",
+                        params=params,
+                        headers={
+                            "User-Agent": self.session.headers.get("User-Agent", ""),
+                            "Accept": self.session.headers.get("Accept", "application/json"),
+                        },
+                        timeout=30,
+                    )
+                candidate.raise_for_status()
+                response = candidate
+                break
+            except requests.Timeout:
+                wait_seconds = min(8, 2 ** attempt)
+                logger.warning(
+                    "CORE request timed out (attempt %s/3). Retrying in %ss",
+                    attempt + 1, wait_seconds,
+                )
+                time.sleep(wait_seconds)
+        return response
 
-            if response is None:
-                return papers
+    def search(
+        self,
+        query: str,
+        max_results: int = 10,
+        sorted_by: str = "relevance",
+        year: Optional[str] = None,
+        author: Optional[str] = None,
+    ) -> List[Paper]:
+        """Search CORE using only q, limit, offset, and sort URL parameters."""
+        self._validate_max_results(max_results)
+        search_query = self._build_search_query(query, year=year, author=author)
+        sort = self._map_sort(sorted_by)
+        papers: List[Paper] = []
+        offset = 0
 
-            data = response.json()
+        while offset < max_results:
+            limit = min(self.PAGE_SIZE, max_results - offset)
+            params = {
+                "q": search_query,
+                "limit": limit,
+                "offset": offset,
+                "sort": sort,
+            }
+            try:
+                response = self._request_page(params)
+                if response is None:
+                    break
+                results = response.json().get("results", [])
+            except requests.RequestException as exc:
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                logger.error("CORE search request error (status=%s): %s", status_code, exc)
+                break
+            except Exception as exc:
+                logger.error("Unexpected error in CORE search: %s", exc)
+                break
 
-            # Parse results
-            results = data.get('results', [])
+            if not results:
+                break
             for item in results:
                 try:
                     paper = self._parse_item(item)
                     if paper:
                         papers.append(paper)
-                        if len(papers) >= max_results:
-                            break
-                except Exception as e:
-                    logger.warning(f"Error parsing CORE item: {e}")
-                    continue
+                except Exception as exc:
+                    logger.warning("Error parsing CORE item: %s", exc)
 
-            logger.info(f"CORE search returned {len(papers)} papers for query: {query}")
+            if len(results) < limit:
+                break
+            offset += limit
 
-        except requests.RequestException as e:
-            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
-            if status_code == 401:
-                logger.error("CORE API authentication failed. Check your API key.")
-            elif status_code == 429:
-                logger.error("CORE API rate limit exceeded. Consider adding API key or reducing frequency.")
-            else:
-                logger.error(f"CORE search request error (status={status_code}): {e}")
-        except Exception as e:
-            logger.error(f"Unexpected error in CORE search: {e}")
-
-        return papers
+        logger.info("CORE search returned %s papers for query: %s", len(papers), query)
+        return papers[:max_results]
 
     def _parse_item(self, item: Dict[str, Any]) -> Optional[Paper]:
         """Parse a single CORE API result item into a Paper object."""
