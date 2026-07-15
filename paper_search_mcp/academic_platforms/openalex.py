@@ -18,11 +18,6 @@ logger = logging.getLogger(__name__)
 
 OPENALEX_FINANCE_FILTER = "topics.field.id:20"
 OPENALEX_WORK_TYPE_FILTER = "type:article|review"
-OPENALEX_SORT_MAP = {
-    "relevance": "relevance_score:desc",
-    "date": "publication_date:desc",
-    "recency": "updated_date:desc",
-}
 
 
 class OpenAlexSearcher(PaperSource):
@@ -85,15 +80,6 @@ class OpenAlexSearcher(PaperSource):
     def _validate_max_results(max_results: int) -> None:
         if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
             raise ValueError("max_results must be a positive integer")
-
-    @staticmethod
-    def _map_sort(sorted_by: str) -> str:
-        try:
-            return OPENALEX_SORT_MAP[sorted_by]
-        except (KeyError, TypeError):
-            raise ValueError(
-                "OpenAlex sorted_by must be one of: relevance, date, recency"
-            ) from None
 
     def _with_api_key(self, params: Dict[str, Any]) -> Dict[str, Any]:
         if self.api_key:
@@ -166,7 +152,7 @@ class OpenAlexSearcher(PaperSource):
             positions.sort(key=lambda item: item[0])
             return " ".join(word for _, word in positions)
         except Exception as exc:
-            logger.warning("Error reconstructing OpenAlex abstract: %s", exc)
+            logger.debug("Error reconstructing OpenAlex abstract: %s", exc)
             return ""
 
     @staticmethod
@@ -225,24 +211,22 @@ class OpenAlexSearcher(PaperSource):
                 source="openalex",
                 categories=topics[:5],
                 doi=doi,
-                citations=item.get("cited_by_count", 0),
+                citations=item.get("cited_by_count"),
             )
         except Exception as exc:
-            logger.warning("Failed to parse OpenAlex work: %s", exc)
+            logger.debug("Failed to parse OpenAlex work: %s", exc)
             return None
 
     def search(
         self,
         query: str,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         year: Optional[str] = None,
         author: Optional[str] = None,
     ) -> List[Paper]:
         """Search OpenAlex using phrase search, filters, sort, and cursor paging."""
         self._validate_max_results(max_results)
         search_phrase = self._normalize_phrase(query, "query")
-        sort = self._map_sort(sorted_by)
         author_id = self._resolve_author_id(author) if author is not None else None
         if author is not None and author_id is None:
             return []
@@ -257,7 +241,7 @@ class OpenAlexSearcher(PaperSource):
             params: Dict[str, Any] = {
                 "search": search_phrase,
                 "filter": work_filter,
-                "sort": sort,
+                "sort": "relevance_score:desc",
                 "per_page": per_page,
             }
             if cursor is not None:

@@ -46,13 +46,6 @@ class TestOpenAlexParameters(unittest.TestCase):
             "authorships.author.id:A123456789,type:article|review",
         )
 
-    def test_sort_mapping_uses_openalex_fields(self):
-        self.assertEqual(self.searcher._map_sort("relevance"), "relevance_score:desc")
-        self.assertEqual(self.searcher._map_sort("date"), "publication_date:desc")
-        self.assertEqual(self.searcher._map_sort("recency"), "updated_date:desc")
-        with self.assertRaisesRegex(ValueError, "relevance, date, recency"):
-            self.searcher._map_sort("updated")
-
     def test_max_results_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
             with self.subTest(value=value):
@@ -94,7 +87,6 @@ class TestOpenAlexParameters(unittest.TestCase):
             papers = self.searcher.search(
                 "  momentum   factor ",
                 max_results=50,
-                sorted_by="date",
                 year="2024",
             )
 
@@ -104,7 +96,7 @@ class TestOpenAlexParameters(unittest.TestCase):
             {
                 "search": '"momentum factor"',
                 "filter": "topics.field.id:20,publication_year:2024,type:article|review",
-                "sort": "publication_date:desc",
+                "sort": "relevance_score:desc",
                 "per_page": 50,
                 "api_key": "test-openalex-key",
             },
@@ -121,15 +113,13 @@ class TestOpenAlexParameters(unittest.TestCase):
         ) as request, patch.object(
             self.searcher, "_parse_work", side_effect=lambda item: item
         ):
-            papers = self.searcher.search(
-                "momentum factor", max_results=250, sorted_by="recency"
-            )
+            papers = self.searcher.search("momentum factor", max_results=250)
 
         self.assertEqual(len(papers), 250)
         base = {
             "search": '"momentum factor"',
             "filter": "topics.field.id:20,type:article|review",
-            "sort": "updated_date:desc",
+            "sort": "relevance_score:desc",
             "api_key": "test-openalex-key",
         }
         self.assertEqual(

@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
+
+import requests
 
 from paper_search_mcp.academic_platforms.arxiv import ArxivSearcher
 
@@ -63,13 +65,6 @@ class TestArxivQueryBuilding(unittest.TestCase):
             "submittedDate:[202001010000 TO 202612312359]",
         )
 
-    def test_sort_mapping(self):
-        self.assertEqual(ArxivSearcher._map_sort("relevance"), "relevance")
-        self.assertEqual(ArxivSearcher._map_sort("date"), "submittedDate")
-        self.assertEqual(ArxivSearcher._map_sort("updated"), "lastUpdatedDate")
-        with self.assertRaises(ValueError):
-            ArxivSearcher._map_sort("ascending")
-
     def test_max_results_bounds(self):
         for value in (1, 30_000):
             ArxivSearcher._validate_max_results(value)
@@ -79,9 +74,8 @@ class TestArxivQueryBuilding(unittest.TestCase):
 
 
 class TestArxivPagination(unittest.TestCase):
-    @patch("paper_search_mcp.academic_platforms.arxiv.time.sleep")
     @patch("paper_search_mcp.academic_platforms.arxiv.feedparser.parse")
-    def test_more_than_2000_results_uses_start_pagination(self, parse, sleep):
+    def test_more_than_2000_results_uses_start_pagination(self, parse):
         first_entries = [object()] * 2_000
         second_entries = [object()]
         parse.side_effect = [
@@ -93,18 +87,17 @@ class TestArxivPagination(unittest.TestCase):
 
         with patch.object(searcher, "_request_page", side_effect=responses) as request_page:
             with patch.object(searcher, "_parse_entry", side_effect=lambda entry: entry):
-                papers = searcher.search("momentum", max_results=2_001, sorted_by="date")
+                papers = searcher.search("momentum", max_results=2_001)
 
         self.assertEqual(len(papers), 2_001)
         first_params = request_page.call_args_list[0].args[0]
         second_params = request_page.call_args_list[1].args[0]
         self.assertEqual(first_params["start"], 0)
         self.assertEqual(first_params["max_results"], 2_000)
-        self.assertEqual(first_params["sortBy"], "submittedDate")
+        self.assertEqual(first_params["sortBy"], "relevance")
         self.assertEqual(first_params["sortOrder"], "descending")
         self.assertEqual(second_params["start"], 2_000)
         self.assertEqual(second_params["max_results"], 1)
-        sleep.assert_called_once_with(3)
 
     @patch("paper_search_mcp.academic_platforms.arxiv.feedparser.parse")
     def test_parse_failure_does_not_abort_page(self, parse):
@@ -122,6 +115,73 @@ class TestArxivPagination(unittest.TestCase):
         ):
             with patch.object(searcher, "_parse_entry", side_effect=parse_entry):
                 self.assertEqual(searcher.search("momentum", max_results=2), [good])
+
+
+class TestArxivRequestPolicy(unittest.TestCase):
+    def setUp(self):
+        self.searcher = ArxivSearcher()
+
+    def test_api_uses_https(self):
+        self.assertEqual(
+            self.searcher.BASE_URL, "https://export.arxiv.org/api/query"
+        )
+
+    def test_requests_are_single_connection_and_at_least_three_seconds_apart(self):
+        self.searcher._last_request_started_at = 100.0
+        response = Mock(status_code=200)
+        self.searcher.session.get = Mock(return_value=response)
+
+        with patch(
+            "paper_search_mcp.academic_platforms.arxiv.time.monotonic",
+            side_effect=[101.0, 103.0],
+        ), patch("paper_search_mcp.academic_platforms.arxiv.time.sleep") as sleep:
+            result = self.searcher._request_once({"max_results": 1})
+
+        self.assertIs(result, response)
+        sleep.assert_called_once_with(2.0)
+        self.searcher.session.get.assert_called_once_with(
+            self.searcher.BASE_URL,
+            params={"max_results": 1},
+            timeout=30,
+        )
+
+    def test_retry_after_header_is_honored_for_429(self):
+        limited = Mock(status_code=429, headers={"Retry-After": "8"})
+        success = Mock(status_code=200)
+        with patch.object(
+            self.searcher, "_request_once", side_effect=[limited, success]
+        ), patch("paper_search_mcp.academic_platforms.arxiv.time.sleep") as sleep:
+            result = self.searcher._request_page({"max_results": 1})
+
+        self.assertIs(result, success)
+        sleep.assert_called_once_with(8.0)
+
+    def test_connection_failures_use_three_six_and_twelve_second_backoff(self):
+        success = Mock(status_code=200)
+        with patch.object(
+            self.searcher,
+            "_request_once",
+            side_effect=[
+                requests.ConnectionError("first"),
+                requests.ConnectionError("second"),
+                requests.ConnectionError("third"),
+                success,
+            ],
+        ), patch("paper_search_mcp.academic_platforms.arxiv.time.sleep") as sleep:
+            result = self.searcher._request_page({"max_results": 1})
+
+        self.assertIs(result, success)
+        self.assertEqual(
+            sleep.call_args_list, [call(3.0), call(6.0), call(12.0)]
+        )
+
+    def test_exhausted_rate_limit_is_reported(self):
+        limited = Mock(status_code=429, headers={}, text="Rate exceeded.")
+        with patch.object(self.searcher, "_request_once", return_value=limited), patch(
+            "paper_search_mcp.academic_platforms.arxiv.time.sleep"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "status=429.*Rate exceeded"):
+                self.searcher._request_page({"max_results": 1})
 
 
 if __name__ == "__main__":

@@ -20,15 +20,10 @@ class TestSemanticParameters(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "start must not be greater"):
             SemanticSearcher._validate_year("2026-2020")
 
-    def test_recency_falls_back_to_relevance(self):
-        self.assertEqual(SemanticSearcher._validate_sort("recency"), "relevance")
-        self.assertEqual(SemanticSearcher._validate_sort("date"), "date")
-        with self.assertRaises(ValueError):
-            SemanticSearcher._validate_sort("updated")
-
-    def test_max_results_must_be_positive(self):
+    def test_max_results_must_fit_native_relevance_limit(self):
         SemanticSearcher._validate_max_results(1)
-        for value in (0, -1, True, 1.5):
+        SemanticSearcher._validate_max_results(1_000)
+        for value in (0, -1, 1_001, True, 1.5):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SemanticSearcher._validate_max_results(value)
 
@@ -65,55 +60,11 @@ class TestSemanticEndpoints(unittest.TestCase):
         )
         self.assertTrue(all("sort" not in item and "token" not in item for item in params))
 
-    def test_date_uses_bulk_token_pagination(self):
-        payloads = [
-            {"data": self._items(0, 1000), "token": "next-token"},
-            {"data": self._items(1000, 250)},
-        ]
-        with patch.object(self.searcher, "_get_json", side_effect=payloads) as request:
-            with patch.object(self.searcher, "_parse_paper", side_effect=lambda item: item):
-                papers = self.searcher.search(
-                    "momentum factor",
-                    year="2020-2026",
-                    max_results=1250,
-                    sorted_by="date",
-                )
-
-        self.assertEqual(len(papers), 1250)
-        self.assertEqual(
-            [call.args[0] for call in request.call_args_list],
-            ["paper/search/bulk", "paper/search/bulk"],
-        )
-        first, second = [call.args[1] for call in request.call_args_list]
-        self.assertEqual(first["sort"], "publicationDate:desc")
-        self.assertNotIn("token", first)
-        self.assertEqual(second["token"], "next-token")
-        self.assertNotIn("limit", first)
-        self.assertNotIn("offset", first)
-
-    def test_recency_uses_native_relevance_endpoint(self):
-        with patch.object(
-            self.searcher, "_get_json", return_value={"data": self._items(0, 2)}
-        ) as request:
-            with patch.object(self.searcher, "_parse_paper", side_effect=lambda item: item):
-                papers = self.searcher.search(
-                    "momentum", max_results=2, sorted_by="recency"
-                )
-        self.assertEqual(len(papers), 2)
-        self.assertEqual(request.call_args.args[0], "paper/search")
-        self.assertNotIn("sort", request.call_args.args[1])
-
-    def test_relevance_over_1000_switches_to_bulk_without_sort(self):
-        with patch.object(
-            self.searcher,
-            "_get_json",
-            return_value={"data": self._items(0, 1001)},
-        ) as request:
-            with patch.object(self.searcher, "_parse_paper", side_effect=lambda item: item):
-                papers = self.searcher.search("momentum", max_results=1001)
-        self.assertEqual(len(papers), 1001)
-        self.assertEqual(request.call_args.args[0], "paper/search/bulk")
-        self.assertNotIn("sort", request.call_args.args[1])
+    def test_over_1000_is_rejected_instead_of_losing_relevance_order(self):
+        with patch.object(self.searcher, "_get_json") as request:
+            with self.assertRaisesRegex(ValueError, "1 to 1000"):
+                self.searcher.search("momentum", max_results=1001)
+        request.assert_not_called()
 
     def test_author_uses_two_stage_workflow_and_local_filters(self):
         papers = [
@@ -171,11 +122,10 @@ class TestSemanticEndpoints(unittest.TestCase):
                     "momentum factor",
                     year="2020-2024",
                     max_results=10,
-                    sorted_by="date",
                     author="ABC",
                 )
 
-        self.assertEqual([item["paperId"] for item in results], ["new", "old"])
+        self.assertEqual([item["paperId"] for item in results], ["old", "new"])
         self.assertEqual(request.call_args_list[0].args[0], "author/search")
         self.assertEqual(request.call_args_list[0].args[1]["query"], "ABC")
 

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import logging
 import os
 import re
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -17,18 +20,18 @@ from ..utils import extract_doi
 from .base import PaperSource
 
 
+logger = logging.getLogger(__name__)
+
+
 class ArxivSearcher(PaperSource):
     """Search arXiv's quantitative-finance categories."""
 
-    BASE_URL = "http://export.arxiv.org/api/query"
+    BASE_URL = "https://export.arxiv.org/api/query"
     MAX_RESULTS = 30_000
     PAGE_SIZE = 2_000
+    MIN_REQUEST_INTERVAL = 3.0
+    MAX_ATTEMPTS = 4
     EARLIEST_DATE = "199101010000"
-    SORT_BY = {
-        "relevance": "relevance",
-        "date": "submittedDate",
-        "updated": "lastUpdatedDate",
-    }
     FINANCE_SUBJECTS = (
         "(cat:q-fin.CP OR cat:q-fin.EC OR cat:q-fin.GN OR cat:q-fin.MF "
         "OR cat:q-fin.PM OR cat:q-fin.PR OR cat:q-fin.RM OR cat:q-fin.ST "
@@ -40,6 +43,8 @@ class ArxivSearcher(PaperSource):
     )
 
     def __init__(self) -> None:
+        self._request_lock = threading.Lock()
+        self._last_request_started_at: Optional[float] = None
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -133,27 +138,74 @@ class ArxivSearcher(PaperSource):
             raise ValueError("max_results must be between 1 and 30000")
 
     @classmethod
-    def _map_sort(cls, sorted_by: str) -> str:
-        try:
-            return cls.SORT_BY[sorted_by]
-        except (KeyError, TypeError):
-            raise ValueError("sorted_by must be one of: relevance, date, updated") from None
+    def _retry_delay(cls, response: Optional[requests.Response], attempt: int) -> float:
+        """Return Retry-After or a 3/6/12-second exponential delay."""
+        backoff = cls.MIN_REQUEST_INTERVAL * (2**attempt)
+        if response is None:
+            return backoff
 
-    def _request_page(self, params: dict[str, Any]):
-        response = None
-        for attempt in range(3):
+        retry_after = response.headers.get("Retry-After", "").strip()
+        if not retry_after:
+            return backoff
+        try:
+            return max(backoff, float(retry_after))
+        except ValueError:
             try:
-                response = self.session.get(self.BASE_URL, params=params, timeout=30)
-            except requests.RequestException:
-                time.sleep((attempt + 1) * 1.5)
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                return max(backoff, seconds)
+            except (TypeError, ValueError, OverflowError):
+                return backoff
+
+    def _request_once(self, params: dict[str, Any]) -> requests.Response:
+        """Send one request while enforcing one connection and 3-second spacing."""
+        with self._request_lock:
+            now = time.monotonic()
+            if self._last_request_started_at is not None:
+                remaining = self.MIN_REQUEST_INTERVAL - (
+                    now - self._last_request_started_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._last_request_started_at = time.monotonic()
+            return self.session.get(self.BASE_URL, params=params, timeout=30)
+
+    def _request_page(self, params: dict[str, Any]) -> requests.Response:
+        response = None
+        last_error: Optional[requests.RequestException] = None
+        for attempt in range(self.MAX_ATTEMPTS):
+            try:
+                response = self._request_once(params)
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt + 1 < self.MAX_ATTEMPTS:
+                    time.sleep(self._retry_delay(None, attempt))
                 continue
             if response.status_code == 200:
                 return response
             if response.status_code in (429, 500, 502, 503, 504):
-                time.sleep((attempt + 1) * 1.5)
+                if attempt + 1 < self.MAX_ATTEMPTS:
+                    time.sleep(self._retry_delay(response, attempt))
                 continue
-            break
-        return None
+            detail = response.text[:300].strip()
+            raise RuntimeError(
+                f"arXiv API request failed (status={response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+
+        if response is not None:
+            detail = response.text[:300].strip()
+            raise RuntimeError(
+                f"arXiv API request failed after {self.MAX_ATTEMPTS} attempts "
+                f"(status={response.status_code})"
+                + (f": {detail}" if detail else "")
+            )
+        raise RuntimeError(
+            f"arXiv API connection failed after {self.MAX_ATTEMPTS} attempts: "
+            f"{last_error}"
+        ) from last_error
 
     @staticmethod
     def _parse_entry(entry: Any) -> Paper:
@@ -187,14 +239,12 @@ class ArxivSearcher(PaperSource):
         self,
         query: str,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         year: Optional[str] = None,
         author: Optional[str] = None,
     ) -> List[Paper]:
         """Search arXiv and return at most ``max_results`` papers."""
         self._validate_max_results(max_results)
         search_query = self._build_search_query(query, year=year, author=author)
-        sort_by = self._map_sort(sorted_by)
 
         papers: List[Paper] = []
         start = 0
@@ -204,12 +254,10 @@ class ArxivSearcher(PaperSource):
                 "search_query": search_query,
                 "start": start,
                 "max_results": page_size,
-                "sortBy": sort_by,
+                "sortBy": "relevance",
                 "sortOrder": "descending",
             }
             response = self._request_page(params)
-            if response is None:
-                break
 
             entries = feedparser.parse(response.content).entries
             if not entries:
@@ -218,13 +266,11 @@ class ArxivSearcher(PaperSource):
                 try:
                     papers.append(self._parse_entry(entry))
                 except Exception as exc:
-                    print(f"Error parsing arXiv entry: {exc}")
+                    logger.debug("Error parsing arXiv entry: %s", exc)
 
             if len(entries) < page_size:
                 break
             start += page_size
-            if start < max_results:
-                time.sleep(3)
 
         return papers[:max_results]
 

@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 import re
+import threading
 import time
 from ..paper import Paper
 from ..utils import extract_doi
@@ -43,12 +44,11 @@ class CORESearcher(PaperSource):
 
     BASE_URL = "https://api.core.ac.uk/v3"
     PAGE_SIZE = 100
+    # CORE allows one batch request per 10 seconds. A works search page is a
+    # batch response, so page requests and retries share this start-to-start
+    # interval. The first request is sent immediately.
+    MIN_REQUEST_INTERVAL = 10.0
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-    SORT_BY = {
-        "relevance": "relevance",
-        "date": "recency",
-        "recency": "recency",
-    }
     YEAR_ERROR = (
         "year must use one of: YYYY, YYYY-YYYY, YYYY-, or -YYYY "
         '(for example: "2024", "2020-2024", "2020-", "-2020")'
@@ -67,10 +67,10 @@ class CORESearcher(PaperSource):
             'User-Agent': 'paper-search-mcp/1.0 (mailto:openags@example.com)',
             'Accept': 'application/json'
         })
+        self._request_lock = threading.Lock()
+        self._last_request_started_at: Optional[float] = None
         if self.api_key:
             self.session.headers.update({'Authorization': f'Bearer {self.api_key}'})
-        else:
-            logger.warning("No CORE API key provided. Searches may be rate-limited or return limited results.")
 
     @staticmethod
     def _normalize_phrase(value: str, field_name: str) -> str:
@@ -135,66 +135,70 @@ class CORESearcher(PaperSource):
         if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
             raise ValueError("max_results must be a positive integer")
 
-    @classmethod
-    def _map_sort(cls, sorted_by: str) -> str:
-        try:
-            return cls.SORT_BY[sorted_by]
-        except (KeyError, TypeError):
-            raise ValueError("CORE sorted_by must be one of: relevance, date, recency") from None
+    def _wait_for_request_slot(self) -> None:
+        """Serialize CORE request starts at the documented batch rate."""
+        with self._request_lock:
+            now = time.monotonic()
+            if self._last_request_started_at is not None:
+                remaining = self.MIN_REQUEST_INTERVAL - (
+                    now - self._last_request_started_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._last_request_started_at = time.monotonic()
+
+    def _send_request(
+        self, params: Dict[str, Any], *, authenticated: bool = True
+    ):
+        self._wait_for_request_slot()
+        url = f"{self.BASE_URL}/search/works"
+        if authenticated:
+            return self.session.get(url, params=params, timeout=30)
+        return requests.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": self.session.headers.get("User-Agent", ""),
+                "Accept": self.session.headers.get("Accept", "application/json"),
+            },
+            timeout=30,
+        )
 
     def _request_page(self, params: Dict[str, Any]):
         response = None
         for attempt in range(3):
             try:
-                candidate = self.session.get(
-                    f"{self.BASE_URL}/search/works", params=params, timeout=30
-                )
+                candidate = self._send_request(params)
                 if candidate.status_code in self.RETRYABLE_STATUS_CODES:
-                    wait_seconds = min(8, 2 ** attempt)
-                    logger.warning(
-                        "CORE request returned %s (attempt %s/3). Retrying in %ss",
-                        candidate.status_code, attempt + 1, wait_seconds,
+                    logger.debug(
+                        "CORE request returned %s (attempt %s/3)",
+                        candidate.status_code,
+                        attempt + 1,
                     )
-                    time.sleep(wait_seconds)
                     continue
                 if candidate.status_code in {401, 403} and self.api_key:
-                    logger.warning(
+                    logger.debug(
                         "CORE API key was rejected (status=%s). Retrying once without key.",
                         candidate.status_code,
                     )
-                    candidate = requests.get(
-                        f"{self.BASE_URL}/search/works",
-                        params=params,
-                        headers={
-                            "User-Agent": self.session.headers.get("User-Agent", ""),
-                            "Accept": self.session.headers.get("Accept", "application/json"),
-                        },
-                        timeout=30,
-                    )
+                    candidate = self._send_request(params, authenticated=False)
                 candidate.raise_for_status()
                 response = candidate
                 break
             except requests.Timeout:
-                wait_seconds = min(8, 2 ** attempt)
-                logger.warning(
-                    "CORE request timed out (attempt %s/3). Retrying in %ss",
-                    attempt + 1, wait_seconds,
-                )
-                time.sleep(wait_seconds)
+                logger.debug("CORE request timed out (attempt %s/3)", attempt + 1)
         return response
 
     def search(
         self,
         query: str,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         year: Optional[str] = None,
         author: Optional[str] = None,
     ) -> List[Paper]:
         """Search CORE using only q, limit, offset, and sort URL parameters."""
         self._validate_max_results(max_results)
         search_query = self._build_search_query(query, year=year, author=author)
-        sort = self._map_sort(sorted_by)
         papers: List[Paper] = []
         offset = 0
 
@@ -204,7 +208,7 @@ class CORESearcher(PaperSource):
                 "q": search_query,
                 "limit": limit,
                 "offset": offset,
-                "sort": sort,
+                "sort": "relevance",
             }
             try:
                 response = self._request_page(params)
@@ -213,10 +217,10 @@ class CORESearcher(PaperSource):
                 results = response.json().get("results", [])
             except requests.RequestException as exc:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                logger.error("CORE search request error (status=%s): %s", status_code, exc)
+                logger.debug("CORE search request error (status=%s): %s", status_code, exc)
                 break
             except Exception as exc:
-                logger.error("Unexpected error in CORE search: %s", exc)
+                logger.debug("Unexpected error in CORE search: %s", exc)
                 break
 
             if not results:
@@ -227,13 +231,12 @@ class CORESearcher(PaperSource):
                     if paper:
                         papers.append(paper)
                 except Exception as exc:
-                    logger.warning("Error parsing CORE item: %s", exc)
+                    logger.debug("Error parsing CORE item: %s", exc)
 
             if len(results) < limit:
                 break
             offset += limit
 
-        logger.info("CORE search returned %s papers for query: %s", len(papers), query)
         return papers[:max_results]
 
     def _parse_item(self, item: Dict[str, Any]) -> Optional[Paper]:
@@ -353,7 +356,7 @@ class CORESearcher(PaperSource):
             )
 
         except Exception as e:
-            logger.warning(f"Error parsing CORE item data: {e}")
+            logger.debug(f"Error parsing CORE item data: {e}")
             return None
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:

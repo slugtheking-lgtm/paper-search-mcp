@@ -29,6 +29,22 @@ class TestSemanticSearcher(unittest.TestCase):
     def setUp(self):
         self.searcher = SemanticSearcher()
 
+    def test_graph_requests_are_limited_to_one_per_second(self):
+        response = SimpleNamespace(status_code=200)
+        self.searcher._last_request_started_at = 20.0
+        self.searcher.session.get = Mock(return_value=response)
+
+        with patch(
+            "paper_search_mcp.academic_platforms.semantic.time.monotonic",
+            side_effect=[20.25, 21.0],
+        ), patch("paper_search_mcp.academic_platforms.semantic.time.sleep") as sleep:
+            result = self.searcher._send_api_request(
+                "https://example.test", {"query": "finance"}, {"x-api-key": "key"}
+            )
+
+        self.assertIs(result, response)
+        sleep.assert_called_once_with(0.75)
+
     def _search_or_skip(self, *args, **kwargs):
         try:
             return self.searcher.search(*args, **kwargs)

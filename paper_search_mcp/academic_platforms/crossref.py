@@ -21,13 +21,6 @@ CROSSREF_FINANCE_QUERY = (
     "risk management market microstructure fintech"
 )
 
-CROSSREF_SORT_MAP = {
-    "relevance": "relevance",
-    "date": "published",
-    "recency": "updated",
-}
-
-
 class CrossRefSearcher(PaperSource):
     """Search finance-related metadata through the Crossref Works API."""
 
@@ -118,21 +111,12 @@ class CrossRefSearcher(PaperSource):
         ):
             raise ValueError("max_results must be a positive integer")
 
-    @staticmethod
-    def _map_sort(sorted_by: str) -> str:
-        try:
-            return CROSSREF_SORT_MAP[sorted_by]
-        except (KeyError, TypeError):
-            raise ValueError(
-                "Crossref sorted_by must be one of: relevance, date, recency"
-            ) from None
-
     def _request_json(self, params: Dict[str, Any]) -> dict:
         response = None
         try:
             response = self.session.get(self.WORKS_URL, params=params, timeout=30)
             if response.status_code == 429:
-                logger.warning("Rate limited by Crossref API; retrying in 2 seconds")
+                logger.debug("Rate limited by Crossref API; retrying in 2 seconds")
                 time.sleep(2)
                 response = self.session.get(self.WORKS_URL, params=params, timeout=30)
             response.raise_for_status()
@@ -156,14 +140,13 @@ class CrossRefSearcher(PaperSource):
     def _base_search_params(
         self,
         query: str,
-        sorted_by: str,
         year: Optional[str],
         author: Optional[str],
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {
             "query": self._normalize_query(query),
             "query.bibliographic": CROSSREF_FINANCE_QUERY,
-            "sort": self._map_sort(sorted_by),
+            "sort": "relevance",
             "order": "desc",
             "mailto": self.mailto,
         }
@@ -177,13 +160,12 @@ class CrossRefSearcher(PaperSource):
         self,
         query: str,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         year: Optional[str] = None,
         author: Optional[str] = None,
     ) -> List[Paper]:
         """Search Crossref using native fields and cursor pagination."""
         self._validate_max_results(max_results)
-        base_params = self._base_search_params(query, sorted_by, year, author)
+        base_params = self._base_search_params(query, year, author)
         use_cursor = max_results > self.MAX_ROWS
         cursor: Optional[str] = "*" if use_cursor else None
         papers: List[Paper] = []
@@ -208,7 +190,7 @@ class CrossRefSearcher(PaperSource):
                     if paper:
                         papers.append(paper)
                 except Exception as exc:
-                    logger.warning("Error parsing Crossref item: %s", exc)
+                    logger.debug("Error parsing Crossref item: %s", exc)
                     continue
 
             if not use_cursor or len(items) < rows:
@@ -258,7 +240,7 @@ class CrossRefSearcher(PaperSource):
             
             citations = item.get('is-referenced-by-count')
             if not isinstance(citations, int):
-                citations = 0
+                citations = None
 
             return Paper(
                 paper_id=doi,
@@ -288,7 +270,7 @@ class CrossRefSearcher(PaperSource):
             )
             
         except Exception as e:
-            logger.error(f"Error parsing CrossRef item: {e}")
+            logger.debug(f"Error parsing CrossRef item: {e}")
             return None
     
     def _extract_title(self, item: Dict[str, Any]) -> str:

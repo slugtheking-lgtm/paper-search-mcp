@@ -19,6 +19,10 @@ class TestPackageEntrypoints(unittest.TestCase):
             console_scripts.get("paper-search"),
             "paper_search_mcp.cli:main",
         )
+        self.assertEqual(
+            console_scripts.get("paper-search-api"),
+            "paper_search_mcp.api:main",
+        )
 
 
 if __name__ == "__main__":

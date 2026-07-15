@@ -11,6 +11,7 @@ from .base import PaperSource
 import logging
 from pypdf import PdfReader
 import re
+import threading
 from ..config import get_env
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,9 @@ class SemanticSearcher(PaperSource):
     RELEVANCE_PAGE_SIZE = 100
     RELEVANCE_MAX_RESULTS = 1_000
     AUTHOR_PAGE_SIZE = 1_000
+    # Semantic Scholar's introductory API-key limit is one request per second.
+    # Apply it to every Graph API endpoint and retry handled by this connector.
+    MIN_REQUEST_INTERVAL = 1.0
     PAPER_FIELDS = ",".join(
         [
             "title",
@@ -53,6 +57,8 @@ class SemanticSearcher(PaperSource):
 
     def __init__(self):
         self._setup_session()
+        self._request_lock = threading.Lock()
+        self._last_request_started_at: Optional[float] = None
 
     def _setup_session(self):
         """Initialize session with random user agent"""
@@ -73,7 +79,7 @@ class SemanticSearcher(PaperSource):
         try:
             return datetime.strptime(date_str.strip(), "%Y-%m-%d")
         except ValueError:
-            logger.warning(f"Could not parse date: {date_str}")
+            logger.debug(f"Could not parse date: {date_str}")
             return None
 
     def _extract_url_from_disclaimer(self, disclaimer: str) -> str:
@@ -155,11 +161,11 @@ class SemanticSearcher(PaperSource):
                 source="semantic",
                 categories=categories,
                 doi=doi,
-                citations=item.get("citationCount", 0),
+                citations=item.get("citationCount"),
             )
 
         except Exception as e:
-            logger.warning(f"Failed to parse Semantic paper: {e}")
+            logger.debug(f"Failed to parse Semantic paper: {e}")
             return None
 
     @staticmethod
@@ -170,11 +176,21 @@ class SemanticSearcher(PaperSource):
         """
         api_key = get_env("SEMANTIC_SCHOLAR_API_KEY", "")
         if not api_key or api_key.strip() == "":
-            logger.warning(
-                "No SEMANTIC_SCHOLAR_API_KEY set or it's empty. Using unauthenticated access with lower rate limits."
-            )
             return None
         return api_key.strip()
+
+    def _send_api_request(self, url: str, params: dict, headers: dict):
+        """Send one Graph API request after reserving a one-RPS slot."""
+        with self._request_lock:
+            now = time.monotonic()
+            if self._last_request_started_at is not None:
+                remaining = self.MIN_REQUEST_INTERVAL - (
+                    now - self._last_request_started_at
+                )
+                if remaining > 0:
+                    time.sleep(remaining)
+            self._last_request_started_at = time.monotonic()
+        return self.session.get(url, params=params, headers=headers, timeout=30)
 
     def request_api(self, path: str, params: dict) -> dict:
         """
@@ -189,16 +205,14 @@ class SemanticSearcher(PaperSource):
             try:
                 headers = {"x-api-key": api_key} if api_key else {}
                 url = f"{self.SEMANTIC_BASE_URL}/{path}"
-                response = self.session.get(
-                    url, params=params, headers=headers, timeout=30
-                )
+                response = self._send_api_request(url, params, headers)
 
                 if (
                     response.status_code == 403
                     and api_key
                     and not has_retried_without_key
                 ):
-                    logger.warning(
+                    logger.debug(
                         "Semantic Scholar API key was rejected (403). Retrying without API key."
                     )
                     api_key = None
@@ -214,13 +228,13 @@ class SemanticSearcher(PaperSource):
                             if retry_after and retry_after.isdigit()
                             else retry_delay * (2**attempt)
                         )
-                        logger.warning(
+                        logger.debug(
                             f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}"
                         )
                         time.sleep(wait_time)
                         continue
                     else:
-                        logger.error(
+                        logger.debug(
                             f"Rate limited (429) after {max_retries} attempts. Please wait before making more requests."
                         )
                         return {
@@ -238,7 +252,7 @@ class SemanticSearcher(PaperSource):
                     and api_key
                     and not has_retried_without_key
                 ):
-                    logger.warning(
+                    logger.debug(
                         "Semantic Scholar API key was rejected (403). Retrying without API key."
                     )
                     api_key = None
@@ -252,13 +266,13 @@ class SemanticSearcher(PaperSource):
                             if retry_after and retry_after.isdigit()
                             else retry_delay * (2**attempt)
                         )
-                        logger.warning(
+                        logger.debug(
                             f"Rate limited (429). Waiting {wait_time} seconds before retry {attempt + 1}/{max_retries}"
                         )
                         time.sleep(wait_time)
                         continue
                     else:
-                        logger.error(
+                        logger.debug(
                             f"Rate limited (429) after {max_retries} attempts. Please wait before making more requests."
                         )
                         return {
@@ -267,14 +281,14 @@ class SemanticSearcher(PaperSource):
                             "message": "Too many requests. Please wait before retrying.",
                         }
                 else:
-                    logger.error(f"HTTP Error requesting API: {e}")
+                    logger.debug(f"HTTP Error requesting API: {e}")
                     return {
                         "error": "http_error",
                         "status_code": e.response.status_code,
                         "message": str(e),
                     }
             except Exception as e:
-                logger.error(f"Error requesting API: {e}")
+                logger.debug(f"Error requesting API: {e}")
                 return {"error": "general_error", "message": str(e)}
 
         return {
@@ -308,18 +322,14 @@ class SemanticSearcher(PaperSource):
             raise ValueError(cls.YEAR_ERROR)
         return value
 
-    @staticmethod
-    def _validate_max_results(max_results: int) -> None:
-        if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
-            raise ValueError("max_results must be a positive integer")
-
-    @staticmethod
-    def _validate_sort(sorted_by: str) -> str:
-        if sorted_by not in {"relevance", "date", "recency"}:
+    @classmethod
+    def _validate_max_results(cls, max_results: int) -> None:
+        if isinstance(max_results, bool) or not isinstance(max_results, int):
+            raise ValueError("max_results must be an integer from 1 to 1000")
+        if not 1 <= max_results <= cls.RELEVANCE_MAX_RESULTS:
             raise ValueError(
-                "Semantic Scholar sorted_by must be one of: relevance, date, recency"
+                "Semantic Scholar relevance search supports max_results from 1 to 1000"
             )
-        return "relevance" if sorted_by == "recency" else sorted_by
 
     def _get_json(self, path: str, params: dict) -> dict:
         response = self.request_api(path, params)
@@ -377,37 +387,6 @@ class SemanticSearcher(PaperSource):
             offset = int(payload["next"])
         return papers[:max_results]
 
-    def _search_bulk(
-        self,
-        query: str,
-        year: Optional[str],
-        max_results: int,
-        sort_by_date: bool,
-    ) -> List[Paper]:
-        papers: List[Paper] = []
-        token: Optional[str] = None
-        while len(papers) < max_results:
-            params = {
-                "query": query,
-                "fields": self.PAPER_FIELDS,
-                "fieldsOfStudy": self.FINANCE_FIELDS,
-            }
-            if year is not None:
-                params["year"] = year
-            if sort_by_date:
-                params["sort"] = "publicationDate:desc"
-            if token is not None:
-                params["token"] = token
-            payload = self._get_json("paper/search/bulk", params)
-            results = payload.get("data", [])
-            if not results:
-                break
-            papers.extend(self._parse_results(results, max_results - len(papers)))
-            token = payload.get("token")
-            if not token:
-                break
-        return papers[:max_results]
-
     @classmethod
     def _year_bounds(cls, year: Optional[str]) -> tuple[Optional[int], Optional[int]]:
         if year is None:
@@ -459,17 +438,12 @@ class SemanticSearcher(PaperSource):
         score += sum(abstract.count(term.casefold()) for term in query.split())
         return score, int(item.get("citationCount") or 0)
 
-    @staticmethod
-    def _author_date_key(item: dict) -> tuple[str, int]:
-        return str(item.get("publicationDate") or ""), int(item.get("year") or 0)
-
     def _search_author(
         self,
         author: str,
         query: str,
         year: Optional[str],
         max_results: int,
-        sorted_by: str,
     ) -> List[Paper]:
         author_payload = self._get_json(
             "author/search", {"query": author, "limit": 10, "fields": "name,paperCount"}
@@ -511,12 +485,9 @@ class SemanticSearcher(PaperSource):
                 break
             offset = int(next_offset)
 
-        if sorted_by == "date":
-            items.sort(key=self._author_date_key, reverse=True)
-        else:
-            items.sort(
-                key=lambda item: self._author_relevance_key(item, query), reverse=True
-            )
+        items.sort(
+            key=lambda item: self._author_relevance_key(item, query), reverse=True
+        )
         return self._parse_results(items, max_results)
 
     def search(
@@ -524,16 +495,14 @@ class SemanticSearcher(PaperSource):
         query: str,
         year: Optional[str] = None,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         author: Optional[str] = None,
         fetch_details: bool = False,
     ) -> List[Paper]:
-        """Search Semantic Scholar using relevance, bulk, or author workflows."""
+        """Search Semantic Scholar using native or locally scored relevance."""
         del fetch_details  # Retained only for backward compatibility.
         normalized_query = self._normalize_text(query, "query")
         normalized_year = self._validate_year(year)
         self._validate_max_results(max_results)
-        effective_sort = self._validate_sort(sorted_by)
 
         if author is not None:
             normalized_author = self._normalize_text(author, "author")
@@ -542,19 +511,6 @@ class SemanticSearcher(PaperSource):
                 normalized_query,
                 normalized_year,
                 max_results,
-                effective_sort,
-            )
-        if effective_sort == "date":
-            return self._search_bulk(
-                normalized_query, normalized_year, max_results, sort_by_date=True
-            )
-        if max_results > self.RELEVANCE_MAX_RESULTS:
-            logger.warning(
-                "Semantic Scholar relevance search is limited to 1000 results; "
-                "switching to bulk retrieval without relevance ranking."
-            )
-            return self._search_bulk(
-                normalized_query, normalized_year, max_results, sort_by_date=False
             )
         return self._search_relevance(normalized_query, normalized_year, max_results)
 

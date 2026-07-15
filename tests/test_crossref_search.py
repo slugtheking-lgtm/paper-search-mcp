@@ -15,7 +15,7 @@ class TestCrossrefParameters(unittest.TestCase):
 
     def test_query_is_plain_text_not_a_quoted_or_boolean_expression(self):
         params = self.searcher._base_search_params(
-            "  momentum factor  ", "relevance", None, None
+            "  momentum factor  ", None, None
         )
         self.assertEqual(params["query"], "momentum factor")
         self.assertNotEqual(params["query"], '"momentum factor"')
@@ -24,7 +24,7 @@ class TestCrossrefParameters(unittest.TestCase):
 
     def test_query_is_not_rewritten_and_author_is_normalized(self):
         params = self.searcher._base_search_params(
-            "momentum   factor", "relevance", None, '"Clifford  Asness"'
+            "momentum   factor", None, '"Clifford  Asness"'
         )
         self.assertEqual(params["query"], "momentum   factor")
         self.assertEqual(params["query.author"], "Clifford Asness")
@@ -54,7 +54,7 @@ class TestCrossrefParameters(unittest.TestCase):
 
     def test_complete_native_parameter_mapping(self):
         params = self.searcher._base_search_params(
-            "momentum factor", "date", "2020-2026", "ABC"
+            "momentum factor", "2020-2026", "ABC"
         )
         self.assertEqual(
             params,
@@ -63,7 +63,7 @@ class TestCrossrefParameters(unittest.TestCase):
                 "query.author": "ABC",
                 "query.bibliographic": CROSSREF_FINANCE_QUERY,
                 "filter": "from-pub-date:2020-01-01,until-pub-date:2026-12-31",
-                "sort": "published",
+                "sort": "relevance",
                 "order": "desc",
                 "mailto": "researcher@example.com",
             },
@@ -71,17 +71,10 @@ class TestCrossrefParameters(unittest.TestCase):
 
     def test_optional_author_and_year_are_omitted(self):
         params = self.searcher._base_search_params(
-            "asset pricing", "relevance", None, None
+            "asset pricing", None, None
         )
         self.assertNotIn("query.author", params)
         self.assertNotIn("filter", params)
-
-    def test_sort_mapping_uses_crossref_fields(self):
-        self.assertEqual(self.searcher._map_sort("relevance"), "relevance")
-        self.assertEqual(self.searcher._map_sort("date"), "published")
-        self.assertEqual(self.searcher._map_sort("recency"), "updated")
-        with self.assertRaisesRegex(ValueError, "relevance, date, recency"):
-            self.searcher._map_sort("updated")
 
     def test_max_results_must_be_a_positive_integer(self):
         for value in (0, -1, True, 1.5):
@@ -96,9 +89,7 @@ class TestCrossrefParameters(unittest.TestCase):
         ) as request, patch.object(
             self.searcher, "_parse_crossref_item", return_value="paper"
         ):
-            papers = self.searcher.search(
-                "momentum factor", max_results=250, sorted_by="relevance"
-            )
+            papers = self.searcher.search("momentum factor", max_results=250)
 
         self.assertEqual(papers, ["paper"])
         sent = request.call_args.args[0]
@@ -131,15 +122,13 @@ class TestCrossrefParameters(unittest.TestCase):
         ) as request, patch.object(
             self.searcher, "_parse_crossref_item", side_effect=lambda item: item
         ):
-            papers = self.searcher.search(
-                "momentum factor", max_results=2500, sorted_by="recency"
-            )
+            papers = self.searcher.search("momentum factor", max_results=2500)
 
         self.assertEqual(len(papers), 2500)
         calls = request.call_args_list
         self.assertEqual([c.args[0]["rows"] for c in calls], [1000, 1000, 500])
         self.assertEqual([c.args[0]["cursor"] for c in calls], ["*", "c2", "c3"])
-        self.assertTrue(all(c.args[0]["sort"] == "updated" for c in calls))
+        self.assertTrue(all(c.args[0]["sort"] == "relevance" for c in calls))
 
     def test_short_page_stops_even_when_next_cursor_exists(self):
         page = {
@@ -178,9 +167,7 @@ class TestCrossrefParameters(unittest.TestCase):
         sleep.assert_called_once_with(2)
 
     def test_mailto_is_used_in_params_and_user_agent(self):
-        params = self.searcher._base_search_params(
-            "asset pricing", "relevance", None, None
-        )
+        params = self.searcher._base_search_params("asset pricing", None, None)
         self.assertEqual(params["mailto"], "researcher@example.com")
         self.assertIn(
             "mailto:researcher@example.com", self.searcher.session.headers["User-Agent"]

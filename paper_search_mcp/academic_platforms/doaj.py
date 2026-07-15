@@ -41,16 +41,6 @@ DOAJ_FINANCE_FILTER = (
     ")"
 )
 
-DOAJ_SORT_MAP = {
-    "relevance": None,
-    # DOAJ's live search index rejects bibjson.year as a sort field. These
-    # top-level record timestamps are explicitly present in the article schema
-    # and accepted by the API's field:direction sort syntax.
-    "date": "created_date",
-    "recency": "last_updated",
-}
-
-
 class DOAJSearcher(PaperSource):
     """Searcher for DOAJ (Directory of Open Access Journals)."""
 
@@ -78,13 +68,6 @@ class DOAJSearcher(PaperSource):
 
         if self.api_key:
             self.session.headers.update({'X-API-Key': self.api_key})
-            logger.info("DOAJ API key configured")
-        else:
-            logger.warning(
-                "No DOAJ API key provided. Searches will use public access "
-                "with rate limits (100 requests/hour). "
-                "Get a free API key at: https://doaj.org/apply-for-api-key/"
-            )
 
     @staticmethod
     def _normalize_phrase(value: str, field_name: str) -> str:
@@ -121,9 +104,9 @@ class DOAJSearcher(PaperSource):
                 raise ValueError("year start must not be greater than year end")
             return f"bibjson.year:[{start_year:04d} TO {end_year:04d}]"
         if since:
-            return f"bibjson.year:[{since.group(1)} TO *]"
+            return f"bibjson.year:>={since.group(1)}"
         if until:
-            return f"bibjson.year:[* TO {until.group(1)}]"
+            return f"bibjson.year:<={until.group(1)}"
         raise ValueError(cls.YEAR_ERROR)
 
     @classmethod
@@ -146,26 +129,16 @@ class DOAJSearcher(PaperSource):
         if isinstance(max_results, bool) or not isinstance(max_results, int) or max_results < 1:
             raise ValueError("max_results must be a positive integer")
 
-    @staticmethod
-    def _map_sort(sorted_by: str) -> Optional[str]:
-        try:
-            field = DOAJ_SORT_MAP[sorted_by]
-        except (KeyError, TypeError):
-            raise ValueError("DOAJ sorted_by must be one of: relevance, date, recency") from None
-        return f"{field}:desc" if field is not None else None
-
     def search(
         self,
         query: str,
         max_results: int = 10,
-        sorted_by: str = "relevance",
         year: Optional[str] = None,
         author: Optional[str] = None,
     ) -> List[Paper]:
         """Search DOAJ with client-controlled page and pageSize pagination."""
         self._validate_max_results(max_results)
         search_query = self._build_search_query(query, year=year, author=author)
-        sort = self._map_sort(sorted_by)
         search_url = f"{self.BASE_URL}/search/articles/{quote(search_query, safe='')}"
         papers: List[Paper] = []
         records_seen = 0
@@ -174,8 +147,6 @@ class DOAJSearcher(PaperSource):
         while records_seen < max_results:
             page_size = min(self.PAGE_SIZE, max_results - records_seen)
             params: Dict[str, Any] = {"page": page, "pageSize": page_size}
-            if sort is not None:
-                params["sort"] = sort
 
             try:
                 response = self.session.get(search_url, params=params, timeout=30)
@@ -183,19 +154,19 @@ class DOAJSearcher(PaperSource):
                 data = response.json()
             except requests.exceptions.RequestException as exc:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                logger.error("DOAJ API request failed (status=%s): %s", status_code, exc)
+                logger.debug("DOAJ API request failed (status=%s): %s", status_code, exc)
                 if status_code is not None:
                     if status_code == 429:
-                        logger.warning("DOAJ rate limit exceeded. Consider using API key.")
+                        logger.debug("DOAJ rate limit exceeded.")
                 raise RuntimeError(
                     f"DOAJ API request failed (status={status_code}): {exc}"
                 ) from exc
             except ValueError as exc:
-                logger.error("Failed to parse DOAJ JSON response: %s", exc)
+                logger.debug("Failed to parse DOAJ JSON response: %s", exc)
                 raise RuntimeError("DOAJ returned an invalid JSON response") from exc
 
             if "error" in data:
-                logger.error("DOAJ API error: %s", data["error"])
+                logger.debug("DOAJ API error: %s", data["error"])
                 raise RuntimeError(f'DOAJ API error: {data["error"]}')
             results = data.get("results", [])
             if not results:
@@ -207,7 +178,7 @@ class DOAJSearcher(PaperSource):
                     if paper:
                         papers.append(paper)
                 except Exception as exc:
-                    logger.warning("Error parsing DOAJ item: %s", exc)
+                    logger.debug("Error parsing DOAJ item: %s", exc)
 
             records_seen += len(results)
             total = data.get("total")
@@ -364,7 +335,7 @@ class DOAJSearcher(PaperSource):
             return paper
 
         except Exception as e:
-            logger.warning(f"Error parsing DOAJ article: {e}")
+            logger.debug(f"Error parsing DOAJ article: {e}")
             return None
 
     def download_pdf(self, paper_id: str, save_path: str) -> str:

@@ -28,8 +28,8 @@ class TestDOAJQueryBuilding(unittest.TestCase):
         cases = {
             "2024": "bibjson.year:2024",
             "2020-2024": "bibjson.year:[2020 TO 2024]",
-            "2020-": "bibjson.year:[2020 TO *]",
-            "-2020": "bibjson.year:[* TO 2020]",
+            "2020-": "bibjson.year:>=2020",
+            "-2020": "bibjson.year:<=2020",
         }
         for value, expected in cases.items():
             with self.subTest(value=value):
@@ -57,13 +57,6 @@ class TestDOAJQueryBuilding(unittest.TestCase):
         self.assertNotIn("yearPublished", result)
         self.assertNotIn("submittedDate", result)
         self.assertNotIn("cat:q-fin", result)
-
-    def test_sort_mapping(self):
-        self.assertIsNone(DOAJSearcher._map_sort("relevance"))
-        self.assertEqual(DOAJSearcher._map_sort("date"), "created_date:desc")
-        self.assertEqual(DOAJSearcher._map_sort("recency"), "last_updated:desc")
-        with self.assertRaises(ValueError):
-            DOAJSearcher._map_sort("updated")
 
     def test_max_results_must_be_positive_integer(self):
         DOAJSearcher._validate_max_results(1)
@@ -99,15 +92,13 @@ class TestDOAJPagination(unittest.TestCase):
                     year="2020-2026",
                     author="ABC",
                     max_results=250,
-                    sorted_by="date",
                 )
 
         self.assertEqual(len(results), 250)
         params = [call.kwargs["params"] for call in request.call_args_list]
         self.assertEqual([item["page"] for item in params], [1, 2, 3])
         self.assertEqual([item["pageSize"] for item in params], [100, 100, 50])
-        self.assertTrue(all(item["sort"] == "created_date:desc" for item in params))
-        self.assertTrue(all(set(item) == {"page", "pageSize", "sort"} for item in params))
+        self.assertTrue(all(set(item) == {"page", "pageSize"} for item in params))
         decoded_query = unquote(request.call_args_list[0].args[0].rsplit("/", 1)[-1])
         self.assertEqual(
             decoded_query,
@@ -139,7 +130,7 @@ class TestDOAJPagination(unittest.TestCase):
         error = requests.HTTPError("bad sort", response=response)
         with patch.object(self.searcher.session, "get", side_effect=error):
             with self.assertRaisesRegex(RuntimeError, "status=400"):
-                self.searcher.search("finance", sorted_by="date")
+                self.searcher.search("finance")
 
 
 class TestDOAJParsing(unittest.TestCase):

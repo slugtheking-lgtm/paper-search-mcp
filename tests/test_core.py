@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from paper_search_mcp.academic_platforms.core import CORE_FINANCE_FILTER, CORESearcher
 
@@ -54,13 +54,6 @@ class TestCOREQueryBuilding(unittest.TestCase):
         self.assertNotIn("submittedDate", result)
         self.assertNotIn("cat:q-fin", result)
 
-    def test_sort_mapping(self):
-        self.assertEqual(CORESearcher._map_sort("relevance"), "relevance")
-        self.assertEqual(CORESearcher._map_sort("date"), "recency")
-        self.assertEqual(CORESearcher._map_sort("recency"), "recency")
-        with self.assertRaises(ValueError):
-            CORESearcher._map_sort("updated")
-
     def test_max_results_must_be_positive_integer(self):
         CORESearcher._validate_max_results(1)
         for value in (0, -1, True, 1.5):
@@ -71,6 +64,20 @@ class TestCOREQueryBuilding(unittest.TestCase):
 class TestCOREPagination(unittest.TestCase):
     def setUp(self):
         self.searcher = CORESearcher(api_key="test-key")
+
+    def test_requests_are_spaced_at_documented_batch_rate(self):
+        response = SimpleNamespace(status_code=200)
+        self.searcher._last_request_started_at = 100.0
+        self.searcher.session.get = Mock(return_value=response)
+
+        with patch(
+            "paper_search_mcp.academic_platforms.core.time.monotonic",
+            side_effect=[103.0, 110.0],
+        ), patch("paper_search_mcp.academic_platforms.core.time.sleep") as sleep:
+            result = self.searcher._send_request({"q": "finance"})
+
+        self.assertIs(result, response)
+        sleep.assert_called_once_with(7.0)
 
     def test_250_results_uses_three_exact_api_requests(self):
         responses = [
@@ -85,14 +92,13 @@ class TestCOREPagination(unittest.TestCase):
                     year="2020-2026",
                     author="ABC",
                     max_results=250,
-                    sorted_by="date",
                 )
 
         self.assertEqual(len(results), 250)
         params = [call.args[0] for call in request.call_args_list]
         self.assertEqual([item["limit"] for item in params], [100, 100, 50])
         self.assertEqual([item["offset"] for item in params], [0, 100, 200])
-        self.assertTrue(all(item["sort"] == "recency" for item in params))
+        self.assertTrue(all(item["sort"] == "relevance" for item in params))
         self.assertTrue(all(set(item) == {"q", "limit", "offset", "sort"} for item in params))
         self.assertEqual(params[0]["q"], params[1]["q"])
 

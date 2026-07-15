@@ -21,7 +21,7 @@ class Paper:
     updated_date: Optional[datetime] = None        # Last updated date
     categories: Optional[List[str]] = None         # Subject categories
     keywords: Optional[List[str]] = None           # Keywords
-    citations: int = 0                             # Citation count
+    citations: Optional[int] = None                 # Citation count, if reported
     references: Optional[List[str]] = None         # List of reference IDs/DOIs
     extra: Optional[Dict] = None                   # Source-specific extra metadata
 
@@ -39,21 +39,26 @@ class Paper:
             self.extra = {}
 
     def to_dict(self) -> Dict:
-        """Convert paper to dictionary format for serialization"""
+        """Convert a paper to the compact public search-result schema."""
+        topics = []
+        for values in (self.categories, self.keywords):
+            if isinstance(values, str):
+                values = [values]
+            for value in values or []:
+                normalized = str(value or "").strip()
+                if normalized and normalized not in topics:
+                    topics.append(normalized)
+
         return {
             'paper_id': self.paper_id,
             'title': self.title,
-            'authors': '; '.join(self.authors) if self.authors else '',
+            'authors': list(self.authors or []),
             'abstract': self.abstract,
-            'doi': self.doi,
-            'published_date': self.published_date.isoformat() if self.published_date else '',
-            'pdf_url': self.pdf_url,
-            'url': self.url,
-            'source': self.source,
-            'updated_date': self.updated_date.isoformat() if self.updated_date else '',
-            'categories': '; '.join(self.categories) if self.categories else '',
-            'keywords': '; '.join(self.keywords) if self.keywords else '',
+            'doi': self.doi or None,
+            'published_date': self.published_date.isoformat() if self.published_date else None,
+            'pdf_url': self.pdf_url or None,
+            'url': self.url or None,
+            'sources': [self.source] if self.source else [],
+            'topics': topics,
             'citations': self.citations,
-            'references': '; '.join(self.references) if self.references else '',
-            'extra': str(self.extra) if self.extra else ''
         }
