@@ -47,6 +47,29 @@ class TestPaperPublicOutput(unittest.TestCase):
         self.assertIsNone(result["citations"])
         self.assertIn("التمويل الأخضر", json.dumps(result, ensure_ascii=False))
 
+    def test_nullable_provider_values_are_safe_for_fastapi_output(self):
+        paper = Paper(
+            paper_id="paper-2",
+            title="Paper without abstract",
+            authors=["Alice", None, ""],
+            abstract=None,
+            doi=None,
+            published_date=None,
+            pdf_url=None,
+            url=None,
+            source="semantic",
+            citations="unknown",
+        )
+
+        result = paper.to_dict()
+
+        self.assertEqual(result["authors"], ["Alice"])
+        self.assertIsNone(result["abstract"])
+        self.assertIsNone(result["doi"])
+        self.assertIsNone(result["pdf_url"])
+        self.assertIsNone(result["url"])
+        self.assertIsNone(result["citations"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,7 +79,7 @@ class PaperResponse(BaseModel):
     paper_id: str
     title: str
     authors: list[str]
-    abstract: str
+    abstract: Optional[str]
     doi: Optional[str]
     published_date: Optional[str]
     pdf_url: Optional[str]

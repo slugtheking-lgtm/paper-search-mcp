@@ -66,6 +66,29 @@ class TestPaperSearchAPI(unittest.TestCase):
                 response = self.client.post("/search", json=payload)
                 self.assertEqual(response.status_code, 422)
 
+    def test_search_response_accepts_missing_abstract(self):
+        paper = {
+            "paper_id": "paper-2",
+            "title": "Paper without abstract",
+            "authors": ["Jane Doe"],
+            "abstract": None,
+            "doi": None,
+            "published_date": None,
+            "pdf_url": None,
+            "url": None,
+            "sources": ["semantic"],
+            "topics": [],
+            "citations": None,
+        }
+        with patch(
+            "paper_search_mcp.api.search_papers",
+            new=AsyncMock(return_value={"papers": [paper]}),
+        ):
+            response = self.client.post("/search", json={"query": "finance"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"papers": [paper]})
+
 
 if __name__ == "__main__":
     unittest.main()

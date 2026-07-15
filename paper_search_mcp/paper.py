@@ -40,6 +40,12 @@ class Paper:
 
     def to_dict(self) -> Dict:
         """Convert a paper to the compact public search-result schema."""
+        authors = []
+        for value in self.authors or []:
+            normalized = str(value or "").strip()
+            if normalized:
+                authors.append(normalized)
+
         topics = []
         for values in (self.categories, self.keywords):
             if isinstance(values, str):
@@ -50,15 +56,19 @@ class Paper:
                     topics.append(normalized)
 
         return {
-            'paper_id': self.paper_id,
-            'title': self.title,
-            'authors': list(self.authors or []),
-            'abstract': self.abstract,
-            'doi': self.doi or None,
+            'paper_id': str(self.paper_id or ''),
+            'title': str(self.title or ''),
+            'authors': authors,
+            'abstract': str(self.abstract) if self.abstract not in (None, '') else None,
+            'doi': str(self.doi) if self.doi not in (None, '') else None,
             'published_date': self.published_date.isoformat() if self.published_date else None,
-            'pdf_url': self.pdf_url or None,
-            'url': self.url or None,
-            'sources': [self.source] if self.source else [],
+            'pdf_url': str(self.pdf_url) if self.pdf_url not in (None, '') else None,
+            'url': str(self.url) if self.url not in (None, '') else None,
+            'sources': [str(self.source)] if self.source else [],
             'topics': topics,
-            'citations': self.citations,
+            'citations': (
+                self.citations
+                if isinstance(self.citations, int) and not isinstance(self.citations, bool)
+                else None
+            ),
         }
